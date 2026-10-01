@@ -24,6 +24,13 @@ macOS Keychain, `caffeinate`, `lockf`, Node.js 내장 SQLite를 사용합니다.
 
 ## 시작하기
 
+소스는 [aside-bot](https://github.com/koreaben777/aside-bot)에서 받습니다. 아래 명령은 설치 안내와 같은 `aside-discord-bot` 폴더에 내려받습니다.
+
+```sh
+git clone https://github.com/koreaben777/aside-bot.git aside-discord-bot
+cd aside-discord-bot
+```
+
 1. [설치와 공통 설정](docs/setup.md): Node.js 24 이상, Aside CLI, 로컬 설정 파일.
 2. [Discord 설정](docs/discord-setup.md) 또는 [Slack 설정](docs/slack-setup.md)을 완료합니다.
 3. 원하는 실행 방식으로 시작합니다.
