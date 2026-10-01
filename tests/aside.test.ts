@@ -59,6 +59,28 @@ test('conversation health needs CLI connection, not a policy certificate', async
  await backend.health();assert.equal(calls.length,2);
  } finally {f.cleanup();}
 });
+
+test('a registered session missing before submission fails safely without queueing or creating a replacement',async()=>{
+ const f=fixture(),marker='a'.repeat(48),calls:string[][]=[];
+ try{
+  await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123',marker);
+  const backend=new AsideBackend(f,async args=>{calls.push(args);return frame({missingSession:'ses_test123'});});
+  await assert.rejects(backend.runTurn('ses_test123','new question',new AbortController().signal),e=>e instanceof BackendFailureError&&e.code==='session_unavailable');
+  assert.ok(!calls.some(args=>args[0]==='exec'||args[1]==='queue'||args[1]==='stop'));
+ }finally{f.cleanup();}
+});
+
+test('an unreadable or mismatched preflight transcript remains uncertain and never submits',async()=>{
+ for(const unavailable of [false,true]){
+  const f=fixture(),calls:string[][]=[];
+  try{
+   await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123','a'.repeat(48));
+   const backend=new AsideBackend(f,async args=>{calls.push(args);if(unavailable)throw new ExecutionUncertainError('cli_execution_unknown');return frame({missingSession:'ses_other123'});});
+   await assert.rejects(backend.runTurn('ses_test123','question',new AbortController().signal),e=>e instanceof ExecutionUncertainError);
+   assert.ok(!calls.some(args=>args[0]==='exec'||args[1]==='queue'));
+  }finally{f.cleanup();}
+ }
+});
 test('wrong CLI version and failed connection never launch a session',async()=>{
  const f=fixture();
  try {for(const bad of ['version','connection']) {

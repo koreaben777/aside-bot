@@ -165,7 +165,10 @@ export class Engine {
           // Generic run/create errors, including timeouts, have unknown remote state.
           // Only an explicit adapter guarantee permits a confirmed safe failure.
           if(this.store.request(req.id)?.state==='running') {
-            if(error instanceof BackendFailureError && error.safeToRetry) this.failure(req.id,req.threadId,'confirmed_backend_failure');
+            if(error instanceof BackendFailureError && error.safeToRetry) {
+              if(error.code==='session_unavailable')this.failure(req.id,req.threadId,'session_unavailable','연결된 Aside 세션을 찾을 수 없습니다. 새 대화에서 질문해 주세요. 이 질문은 Aside에 제출하지 않았습니다.');
+              else this.failure(req.id,req.threadId,'confirmed_backend_failure');
+            }
             else this.uncertain(req.id,active.phase==='creating'?'session_creation_unknown':'execution_unknown');
           }
         } finally {

@@ -31,6 +31,18 @@ async function until(fn:()=>boolean) {
   assert.fail('timed out');
 }
 
+test('missing old session tells the owner to start a new conversation without blocking other work',async()=>{
+ let turns=0;
+ const t=setup({health:async()=>{},createSession:async()=> 'sid',runTurn:async()=>{turns++;if(turns===1)throw new BackendFailureError('session_unavailable');return {text:'new answer'};},stop:async()=>({confirmed:true})});
+ try{
+  t.engine.submit(t.turn('missing-session'));
+  await until(()=>t.store.requestBySource('missing-session')?.state==='failed'&&t.sent.length===1);
+  assert.equal(t.store.requestBySource('missing-session')?.errorCode,'session_unavailable');assert.equal(t.store.hasUncertain(),false);
+  assert.match(t.sent[0]?.content??'',/새 대화/);assert.equal(t.store.outputParts(t.store.requestBySource('missing-session')!.id,'answer').length,0);
+  t.engine.submit(t.turn('next-question'));await until(()=>t.store.requestBySource('next-question')?.state==='completed');
+ }finally{t.cleanup();}
+});
+
 test('transport without dedupe never retries ambiguous delivery, including after restart',async()=>{
  const t=setup();let sends=0;
  Reflect.set(t.engine.outbound,'retrySafe',false);

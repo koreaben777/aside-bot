@@ -234,7 +234,10 @@ export class AsideBackend implements Backend {
     return this.repl(`const result=await aside.sessions.messages(${JSON.stringify(sessionId)},{limit:200,order:'desc'});`);
   }
   private async bootstrapMessages(sessionId: string): Promise<unknown> {
-    return this.repl(`const result=await aside.sessions.messages(${JSON.stringify(sessionId)},{limit:200,order:'asc'});`);
+    const expected=JSON.stringify(sessionId);
+    // This read occurs before submitting a turn. Only the SDK's exact missing-ID
+    // error is a known absence; transport/auth/malformed responses remain unknown.
+    return this.repl(`let result;try{result=await aside.sessions.messages(${expected},{limit:200,order:'asc'});}catch(error){if(error instanceof Error&&/^Session not found: /i.test(error.message)&&error.message.replace(/^Session not found: /i,'')===${expected})result={missingSession:${expected}};else throw error;}`);
   }
   private bootstrapPrompt(marker: string): string {
     return bootstrapPrompt(marker);
@@ -246,7 +249,9 @@ export class AsideBackend implements Backend {
     if (!id(sessionId)) return false;
     const marker = await this.registry.find(sessionId);
     if (!marker) return false;
-    if (!this.hasBootstrap(await this.bootstrapMessages(sessionId), marker, selection)) throw uncertain('session_ownership_unknown');
+    const messages=await this.bootstrapMessages(sessionId);
+    if(record(messages)&&messages.missingSession===sessionId)throw safeFailure('session_unavailable');
+    if (!this.hasBootstrap(messages, marker, selection)) throw uncertain('session_ownership_unknown');
     return true;
   }
   async health(): Promise<void> {

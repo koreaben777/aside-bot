@@ -12,7 +12,7 @@ export type SlackApi=(method:string,body?:Record<string,unknown>)=>Promise<Slack
 const timestamp=/^\d{10,}\.\d{6}$/;
 const channelId=/^[CG][A-Z0-9]{8,}$/;
 const userId=/^[UW][A-Z0-9]{8,}$/;
-export interface SlackChannelOptions {enabled?:boolean;botUserId?:string}
+export interface SlackChannelOptions {enabled?:boolean;botUserId?:string;channelThreadAutoReply?:boolean}
 export function allowedSlackParent(config:BotConfig,parent:string,enabled=false):boolean {
   return parent===config.channelId||enabled&&channelId.test(parent);
 }
@@ -23,7 +23,7 @@ async function assertChannel(api:SlackApi,channel:string,team:string):Promise<vo
 }
 const escape=(text:string)=>text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 const decode=(text:string)=>text.replaceAll('&lt;','<').replaceAll('&gt;','>').replaceAll('&amp;','&');
-const help='DM에 질문을 보내면 새 대화가 시작됩니다. 같은 메시지의 스레드에 답글을 보내면 이어집니다.\n채널에서는 지정 소유자의 첫 @Aside 멘션으로 대화를 연결합니다. 연결된 스레드의 소유자 댓글과 명령에는 멘션이 필요 없습니다. 다른 사용자를 직접 멘션한 댓글은 받지 않습니다. 기존 스레드의 첫 호출은 이전 메시지를 일부 조회하며 조회 실패 시 접수하지 않습니다.\n!aside read recent 질문 · !aside read thread 타임스탬프 질문: 직접 멘션과 함께 같은 채널의 일부 메시지를 명시적으로 조회합니다.\n!aside status · !aside settings · !aside preset fast|standard|deep · !aside help\n중단하려는 스레드에서 !aside stop을 보내세요. 첨부파일은 아직 지원하지 않습니다.';
+const help='DM에 질문을 보내면 새 대화가 시작됩니다. 같은 메시지의 스레드에 답글을 보내면 이어집니다.\n채널에서는 질문과 명령마다 @Aside를 명시적으로 호출하세요. 스레드 자동 응답은 기본 꺼짐입니다. channelThreadAutoReply를 켠 경우에만 연결된 스레드의 소유자 댓글과 명령에 멘션이 필요 없습니다. 자동 응답에서 다른 사용자를 직접 멘션한 댓글은 받지 않습니다. 기존 스레드의 첫 호출은 이전 메시지를 일부 조회하며 조회 실패 시 접수하지 않습니다.\n!aside read recent 질문 · !aside read thread 타임스탬프 질문: 직접 멘션과 함께 같은 채널의 일부 메시지를 명시적으로 조회합니다.\n!aside status · !aside settings · !aside preset fast|standard|deep · !aside help\n중단하려는 스레드에서 !aside stop을 보내세요. 첨부파일은 아직 지원하지 않습니다.';
 
 const before=(a:string,b:string)=>BigInt(a.replace('.',''))<BigInt(b.replace('.',''));
 const clip=(text:string,limit:number)=>{
@@ -115,7 +115,7 @@ export class SlackBot {
     const sourceId=`${c.guildId}:${channel}:${e.ts}`,threadId=`${channel}:${root}`;
     const existing=this.engine.store.session(threadId);
     const validBinding=existing?.guildId===c.guildId&&existing.ownerUserId===c.ownerUserId&&existing.parentChannelId===channel;
-    const channelReply=this.channels.enabled===true&&e.type==='message'&&channelId.test(channel)&&
+    const channelReply=this.channels.enabled===true&&this.channels.channelThreadAutoReply===true&&e.type==='message'&&channelId.test(channel)&&
       (e.channel_type===undefined||e.channel_type==='channel'||e.channel_type==='group')&&e.thread_ts!==undefined&&before(root,e.ts)&&validBinding&&typeof e.text==='string'&&
       ![...e.text.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].some(m=>m[1]!==this.channels.botUserId);
     if(!dm&&!channelMention&&!channelReply)return;

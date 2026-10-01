@@ -40,7 +40,7 @@ try{
   const backend=new AsideBackend({cliPath:config.cliPath,registryPath:join(config.dataDir,'aside-registry.json'),registryKeyPath:join(config.dataDir,'aside-registry.key')});
   stage='Aside CLI 연결';await backend.health();
   engine=new Engine(config,store,backend,createSlackOutbound(api,config,store,config.channelMentions),undefined,new AsideSettings(config.cliPath),parent=>allowedSlackParent(config,parent,config.channelMentions));
-  const bot=new SlackBot(engine,api,config.applicationId,{enabled:config.channelMentions,botUserId:identity.botUserId});
+  const bot=new SlackBot(engine,api,config.applicationId,{enabled:config.channelMentions,botUserId:identity.botUserId,channelThreadAutoReply:config.channelThreadAutoReply});
   // SDK diagnostics may contain tokens, WebSocket URLs or message bodies.
   const silentLogger={getLevel:()=>LogLevel.ERROR,setLevel:()=>{},setName:()=>{},debug:()=>{},info:()=>{},warn:()=>{},error:()=>{}};
   socket=new SocketModeClient({appToken,logger:silentLogger,clientOptions:{timeout:30_000,retryConfig:{retries:0}}});
@@ -55,8 +55,8 @@ try{
   engine.start();
   const retention=()=>store.db.prepare("UPDATE outbox SET content='' WHERE state='sent' AND attempted_at<?").run(Date.now()-24*60*60*1000);
   retention();timer=setInterval(retention,60*60*1000);timer.unref();
-  await writeFile(join(config.dataDir,'startup-status.json'),JSON.stringify({pid:process.pid,ready:true,platform:'slack',readyAt:new Date().toISOString()})+'\n',{mode:0o600});
-  console.log(`Aside Slack 준비 완료: 지정 개인 계정의 1:1 DM${config.channelMentions?' 및 첫 멘션으로 연결된 채널 스레드':''}을 사용합니다.`);
+  await writeFile(join(config.dataDir,'startup-status.json'),JSON.stringify({pid:process.pid,ready:true,platform:'slack',channelThreadAutoReply:config.channelThreadAutoReply,readyAt:new Date().toISOString()})+'\n',{mode:0o600});
+  console.log(`Aside Slack 준비 완료: 지정 개인 계정의 1:1 DM${config.channelMentions?` 및 채널 @Aside 멘션(스레드 자동 응답 ${config.channelThreadAutoReply?'켜짐':'꺼짐'})`:''}을 사용합니다.`);
 }catch{
   console.error(`슬랙 봇 시작 실패: ${stage}. docs/slack-setup.md의 설정과 연결을 확인하세요.`);
   await shutdown(1);

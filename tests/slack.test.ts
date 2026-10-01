@@ -25,7 +25,7 @@ function setup(keepQueued=true){
 
 const channel='C12345678',botUserId='UBOT12345';
 const mention=(ts='1700000000.000001',extra={})=>({api_app_id:config.applicationId,team_id:config.guildId,event:{type:'app_mention',user:config.ownerUserId,channel,ts,text:`<@${botUserId}> question`,...extra}});
-function channelSetup(enabled=true){
+function channelSetup(enabled=true,channelThreadAutoReply=true){
  const t=setup(),calls:Array<{method:string;body:Record<string,unknown>}>=[];
  let member=true,failRead=false,messages:unknown[]=[{ts:'1699999999.000001',user:'UOTHER123',text:'unmentioned context'}];
  const api:slack.SlackApi=async(method,body={})=>{
@@ -40,7 +40,7 @@ function channelSetup(enabled=true){
  const allowed=(parent:string)=>slack.allowedSlackParent(config,parent,enabled);
  const outbound=slack.createSlackOutbound(api,config,t.store,enabled);
  const engine=new Engine(config,t.store,t.engine.backend,outbound,undefined,t.engine.settings,allowed);engine.close();
- const bot=new slack.SlackBot(engine,api,config.applicationId,{enabled,botUserId});
+ const bot=new slack.SlackBot(engine,api,config.applicationId,{enabled,botUserId,channelThreadAutoReply});
  return {...t,engine,bot,api,calls,setMember:(v:boolean)=>{member=v;},setFailRead:()=>{failRead=true;},setMessages:(v:unknown[])=>{messages=v;}};
 }
 
@@ -61,6 +61,36 @@ test('Slack owner replies in bound channel threads need no mention and duplicate
  }finally{t.store.close();}
 });
 
+test('Slack channel auto replies default off and explicit false ignores previously bound threads after reopen',async()=>{
+ for(const option of [undefined,false]){
+  const t=channelSetup(),dir=await mkdtemp(join(tmpdir(),'aside-slack-auto-off-')),path=join(dir,'state.sqlite');let store=new Store(path);
+  try{
+   const root='1700000000.000001',threadId=`${channel}:${root}`;
+   store.bindThread({threadId,guildId:config.guildId,parentChannelId:channel,ownerUserId:config.ownerUserId},`${config.guildId}:${channel}:${root}`);
+   store.close();store=new Store(path);
+   const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));engine.close();
+   const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId,...(option===undefined?{}:{channelThreadAutoReply:option})});
+   for(const text of ['unmentioned question','!aside status'])await bot.handle(mention('1700000000.000002',{thread_ts:root,type:'message',channel_type:'channel',text}));
+   assert.equal(store.pendingCount(),0);assert.equal(t.calls.length,0);
+   await bot.handle(mention('1700000000.000003',{thread_ts:root,text:`<@${botUserId}> explicit followup`}));
+   assert.equal(store.pendingCount(),1);assert.equal(store.requestBySource(`${config.guildId}:${channel}:1700000000.000003`)?.prompt,'explicit followup');
+  }finally{store.close();t.store.close();await rm(dir,{recursive:true,force:true});}
+ }
+});
+
+test('Slack auto replies off preserves first later mention context and owner DM followups',async()=>{
+ const t=channelSetup(true,false);try{
+  await t.bot.handle(mention(undefined,{thread_ts:'1699999999.000001',text:`<@${botUserId}> explain earlier`}));
+  const prompt=t.store.requestBySource(`${config.guildId}:${channel}:1700000000.000001`)?.prompt??'';
+  assert.match(prompt,/unmentioned context/);assert.ok(prompt.endsWith('explain earlier'));
+  await t.bot.handle(mention('1700000000.000002',{thread_ts:'1699999999.000001',type:'message',channel_type:'channel',text:'unmentioned followup'}));
+  assert.equal(t.store.pendingCount(),1);
+  await t.bot.handle(message('1700000000.000003'));
+  await t.bot.handle(message('1700000000.000004',{thread_ts:'1700000000.000003',text:'DM followup without mention'}));
+  assert.equal(t.store.pendingCount(),3);assert.equal(t.store.requestBySource(`${config.guildId}:${config.channelId}:1700000000.000004`)?.prompt,'DM followup without mention');
+ }finally{t.store.close();}
+});
+
 test('Slack bound-thread followups survive reopening the store and reject other recipients and invalid bindings',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'aside-slack-followup-')),path=join(dir,'state.sqlite');
  const t=channelSetup();let store=new Store(path);
@@ -69,7 +99,7 @@ test('Slack bound-thread followups survive reopening the store and reject other 
   store.bindThread({threadId,guildId:config.guildId,parentChannelId:channel,ownerUserId:config.ownerUserId},`${config.guildId}:${channel}:1700000000.000001`);
   store.close();store=new Store(path);
   const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));engine.close();
-  const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId});
+  const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId,channelThreadAutoReply:true});
   const reply=(ts:string,extra={})=>mention(ts,{type:'message',channel_type:'channel',thread_ts:'1700000000.000001',text:'plain followup',...extra});
   await Promise.all([bot.handle(reply('1700000000.000002')),bot.handle(reply('1700000000.000002'))]);
   for(const patch of [{user:'UOTHER123'},{bot_id:'BOTHER123'},{text:'<@UOTHER123> ask another bot'},{thread_ts:'1699999999.000001'},{thread_ts:undefined},{subtype:'message_changed'},{hidden:true},{channel:'COTHER123'}])await bot.handle(reply('1700000000.000003',patch));
@@ -154,7 +184,7 @@ test('Slack channel end-to-end answers and subsequent mentions reuse one Aside s
  const t=channelSetup(),prompts:string[]=[];let created=0;
  const backend:Backend={health:async()=>{},createSession:async()=>{created++;return 'session-id';},runTurn:async(_id,prompt)=>{prompts.push(prompt);return {text:'answer'};},stop:async()=>({confirmed:true})};
  const engine=new Engine(config,t.store,backend,t.engine.outbound,undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));
- const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId});
+ const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId,channelThreadAutoReply:true});
  const until=async(count:number)=>{for(let i=0;i<100;i++){if(t.calls.filter(c=>c.method==='chat.postMessage'&&String(c.body.text).endsWith('answer')).length===count&&t.store.counts().running===0&&t.store.pendingCount()===0)return;await new Promise(r=>setTimeout(r,5));}assert.fail('timed out');};
  try{
   await bot.handle(mention());await until(1);
@@ -411,11 +441,31 @@ test('Slack config reuses runtime but isolates storage and rejects malformed ide
   await writeFile(file,JSON.stringify(base));const c=await loadSlackConfig(file,runtime);
   assert.equal(c.dataDir,join(dir,'slack'));assert.equal(c.guildId,'T12345678');assert.equal(c.keychainService,'local.aside-slack.A12345678');
   assert.equal(c.channelMentions,false);
+  assert.equal(c.channelThreadAutoReply,false);
   await writeFile(file,JSON.stringify({...base,channelMentions:true}));assert.equal((await loadSlackConfig(file,runtime)).channelMentions,true);
+  for(const enabled of [true,false]){
+   await writeFile(file,JSON.stringify({...base,channelThreadAutoReply:enabled}));assert.equal((await loadSlackConfig(file,runtime)).channelThreadAutoReply,enabled);
+  }
+  for(const invalid of ['true','false',1,0,null]){
+   await writeFile(file,JSON.stringify({...base,channelThreadAutoReply:invalid}));await assert.rejects(loadSlackConfig(file,runtime),/invalid_slack_channelThreadAutoReply/);
+  }
   await writeFile(file,JSON.stringify({...base,channelMentions:'true'}));await assert.rejects(loadSlackConfig(file,runtime),/invalid_slack_channelMentions/);
   for(const key of ['ownerUserId','teamId','applicationId']){
    await writeFile(file,JSON.stringify({...base,[key]:'bad;id'}));await assert.rejects(loadSlackConfig(file,runtime),/invalid_slack_/);
   }
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('Slack auto reply environment accepts only true or false and overrides JSON without enabling channel mode',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'aside-slack-auto-env-')),file=join(dir,'slack.json'),runtime=join(dir,'runtime.json');
+ const load=loadSlackConfig;
+ try{
+  await writeFile(runtime,JSON.stringify({ownerUserId:'111111111111111111',guildId:'222222222222222222',channelId:'333333333333333333',applicationId:'444444444444444444',cliPath:process.execPath,asideAccount:'u0',asideModel:'openai-codex/gpt-6-luna',dataDir:dir}));
+  for(const [json,env,expected] of [[true,'false',false],[false,'true',true],[true,undefined,true],[undefined,undefined,false]] as const){
+   await writeFile(file,JSON.stringify({ownerUserId:'U12345678',teamId:'T12345678',applicationId:'A12345678',channelThreadAutoReply:json}));
+   const value=await load(file,runtime,{ASIDE_SLACK_THREAD_AUTO_REPLY:env});assert.equal(value.channelThreadAutoReply,expected);assert.equal(value.channelMentions,false);
+  }
+  for(const env of ['1','0','TRUE','yes',''])await assert.rejects(load(file,runtime,{ASIDE_SLACK_THREAD_AUTO_REPLY:env}),/invalid_slack_ASIDE_SLACK_THREAD_AUTO_REPLY/);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
 
