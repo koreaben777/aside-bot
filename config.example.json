@@ -1,0 +1,10 @@
+{
+  "ownerUserId": "111111111111111111",
+  "guildId": "222222222222222222",
+  "channelId": "333333333333333333",
+  "applicationId": "444444444444444444",
+  "cliPath": "/ABSOLUTE/PATH/TO/aside",
+  "dataDir": "/ABSOLUTE/PATH/TO/aside-discord-bot/.data",
+  "asideAccount": "u0",
+  "asideModel": "openai-codex/gpt-6-luna"
+}

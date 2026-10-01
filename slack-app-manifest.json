@@ -1,0 +1,23 @@
+{
+  "display_information": {
+    "name": "Aside 개인 봇",
+    "description": "개인 DM과 참여 채널의 직접 멘션으로 Aside와 대화합니다"
+  },
+  "features": {
+    "bot_user": {"display_name": "Aside", "always_online": false},
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {"bot": ["chat:write", "im:history", "im:write", "users:read", "app_mentions:read", "channels:read", "channels:history", "groups:read", "groups:history"]}
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "event_subscriptions": {"bot_events": ["message.im", "app_mention"]},
+    "org_deploy_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

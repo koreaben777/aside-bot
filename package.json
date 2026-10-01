@@ -1,0 +1,29 @@
+{
+  "name": "aside-discord-search-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/src/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "doctor": "npm run build && node dist/scripts/doctor.js",
+    "setup:discord": "npm run build && node dist/scripts/setup-discord.js",
+    "setup:slack": "npm run build && node dist/scripts/setup-slack.js",
+    "start:slack": "npm run build && node dist/src/slack/main.js",
+    "service:install": "npm run build && node dist/scripts/install-service.js",
+    "certify": "npm run build && node dist/scripts/certify.js"
+  },
+  "dependencies": {
+    "@slack/socket-mode": "3.1.0",
+    "discord.js": "^14.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
