@@ -56,7 +56,7 @@ try{
   const retention=()=>store.db.prepare("UPDATE outbox SET content='' WHERE state='sent' AND attempted_at<?").run(Date.now()-24*60*60*1000);
   retention();timer=setInterval(retention,60*60*1000);timer.unref();
   await writeFile(join(config.dataDir,'startup-status.json'),JSON.stringify({pid:process.pid,ready:true,platform:'slack',readyAt:new Date().toISOString()})+'\n',{mode:0o600});
-  console.log(`Aside Slack 준비 완료: 지정 개인 계정의 1:1 DM${config.channelMentions?' 및 참여 채널의 직접 멘션':''}을 사용합니다.`);
+  console.log(`Aside Slack 준비 완료: 지정 개인 계정의 1:1 DM${config.channelMentions?' 및 첫 멘션으로 연결된 채널 스레드':''}을 사용합니다.`);
 }catch{
   console.error(`슬랙 봇 시작 실패: ${stage}. docs/slack-setup.md의 설정과 연결을 확인하세요.`);
   await shutdown(1);

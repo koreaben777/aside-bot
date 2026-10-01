@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "Aside 개인 봇",
-    "description": "개인 DM과 참여 채널의 직접 멘션으로 Aside와 대화합니다"
+    "description": "개인 DM과 참여 채널의 멘션으로 시작한 스레드에서 Aside와 대화합니다"
   },
   "features": {
     "bot_user": {"display_name": "Aside", "always_online": false},
@@ -16,7 +16,7 @@
   },
   "settings": {
     "socket_mode_enabled": true,
-    "event_subscriptions": {"bot_events": ["message.im", "app_mention"]},
+    "event_subscriptions": {"bot_events": ["message.im", "app_mention", "message.channels", "message.groups"]},
     "org_deploy_enabled": false,
     "token_rotation_enabled": false
   }
