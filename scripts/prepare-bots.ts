@@ -6,7 +6,7 @@ import {parseSessionList,runAsideCli,shutdownAsideCliChildren} from '../src/asid
 
 export async function prepareBots(signal?:AbortSignal):Promise<void>{
  signal?.throwIfAborted();const config=await loadConfig();signal?.throwIfAborted();await loadSlackConfig();signal?.throwIfAborted();
- await runAsideCli('/usr/bin/open',['-g','-b','at.studio.AsideBrowser'],10_000);signal?.throwIfAborted();
+ await runAsideCli('/usr/bin/open',['-g','-j','-b','at.studio.AsideBrowser'],10_000);signal?.throwIfAborted();
  for(let attempt=0;attempt<10;attempt++){
   signal?.throwIfAborted();
   try{parseSessionList(await runAsideCli(config.cliPath,['session','list','--account',config.asideAccount],5000));signal?.throwIfAborted();return;}catch{signal?.throwIfAborted();}

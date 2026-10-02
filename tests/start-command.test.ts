@@ -8,7 +8,7 @@ import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {pathToFileURL} from 'node:url';
 
-test('start command opens Aside, waits for its connection, and refuses to start on failure',async()=>{
+test('start command opens Aside hidden, waits for its connection, and refuses to start on failure',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'aside-start-'));
  try{
   await mkdir(join(dir,'scripts'));await mkdir(join(dir,'dist/src'),{recursive:true});
@@ -35,7 +35,7 @@ if(scenario==='cancel-preparation'){writeFileSync('cli-pid',String(process.pid))
 `,{mode:0o700});
   await writeFile(join(dir,'config.local.json'),JSON.stringify({ownerUserId:'111111111111111111',guildId:'222222222222222222',channelId:'333333333333333333',applicationId:'444444444444444444',cliPath:cli,asideAccount:'u0',asideModel:'openai-codex/gpt-6-luna',dataDir:join(dir,'data')}));
   await writeFile(join(dir,'open.mjs'),`import {appendFileSync,readFileSync,writeFileSync} from 'node:fs';
-if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['-g','-b','at.studio.AsideBrowser']))process.exit(2);
+if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['-g','-j','-b','at.studio.AsideBrowser']))process.exit(2);
 appendFileSync('events','open\\n');
 if(readFileSync('scenario','utf8')==='open-failed')process.exit(1);
 writeFileSync('opened','yes');`);

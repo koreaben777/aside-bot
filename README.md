@@ -6,6 +6,8 @@ Aside·Slack·Discord의 공식 제품이나 지원 서비스가 아닌 개인 �
 
 macOS Keychain, `caffeinate`, `lockf`, Node.js 내장 SQLite를 사용합니다. 로그인된 Aside Browser와 CLI가 있는 Mac에서 실행합니다. 로컬 모델 가중치를 실행하는 코드는 포함하지 않습니다. Aside의 `local`은 실행 호스트를 뜻합니다.
 
+현재 소스 버전은 **v0.1.1**입니다. 봇 시작 시 Aside를 숨긴 상태로 실행하도록 개선했습니다. 변경 사항과 검증 범위는 [프로젝트 개요서](프로젝트%20개요서.md)를 참고하세요.
+
 ## 지원 기능
 
 개인 Mac용 메뉴바 앱 이름은 **Aside Bot Menu**입니다. 앱 아이콘은 기존 Slack 봇용 컬러스왑 이미지 `macos/AsideBotMenu/Resources/aside-bot-teal-violet.png`를 재사용합니다. `scripts/build-menubar-app.sh`가 원본을 macOS 아이콘 크기별로 변환하고 `AppIcon.icns`로 패키징·서명합니다. 메뉴바의 연결·중지·경고 상태 심볼은 별개입니다. 운영 중인 봇이 있으면 격리 작업 사본에서 빌드하세요.
