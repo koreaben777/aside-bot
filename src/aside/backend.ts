@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
@@ -177,11 +177,18 @@ function finalResponse(messages: unknown, priorIds: ReadonlySet<string>, selecti
   return {text,...(threadTitle?{threadTitle}:{}),...(sourceRecords.length?{sourceText,sources:sourceRecords}:{})};
 }
 
+const cliChildren=new Map<ChildProcess,Promise<void>>();
+let cliStopping=false;
+export async function shutdownAsideCliChildren():Promise<void>{
+ cliStopping=true;const entries=[...cliChildren.entries()];for(const [child] of entries)child.kill('SIGTERM');await Promise.all(entries.map(([,closed])=>closed));
+}
 export function runAsideCli(cliPath: string, args: string[], timeout: number): Promise<string> {
+  if(cliStopping)return Promise.reject(uncertain('cli_shutdown'));
   return new Promise((resolveCommand, reject) => {
     const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' };
     for (const key of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL'] as const) if (process.env[key]) env[key] = process.env[key];
     const child = spawn(cliPath, args, { shell: false, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const closed=new Promise<void>(resolve=>child.once('close',()=>{cliChildren.delete(child);resolve();}));cliChildren.set(child,closed);
     let stdout = '', size = 0, failed = false;
     const fail = () => { failed = true; child.kill('SIGKILL'); };
     const timer = setTimeout(fail, timeout);

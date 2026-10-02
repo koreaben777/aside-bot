@@ -70,8 +70,9 @@ async function post(api:SlackApi,channel:string,ts:string,text:string,context?:s
   if(!result.ts||!timestamp.test(result.ts))throw new Error('slack_delivery_unknown');
   return result.ts;
 }
-export function createSlackOutbound(api:SlackApi,config:BotConfig,store:Store,channelMentions=false):Outbound {
+export function createSlackOutbound(api:SlackApi,config:BotConfig,store:Store,channelMentions=false,stopping:()=>boolean=()=>false):Outbound {
   return {retrySafe:false,progressNotices:false,formatAnswer:formatSlackAnswer,async send(threadId,content,nonce,answerRequestId,_replyToMessageId,progressRequestId){
+    if(stopping())throw Error('service_stopping');
     const bound=store.session(threadId),[channel,ts,...rest]=threadId.split(':');
     if(!bound||bound.guildId!==config.guildId||bound.ownerUserId!==config.ownerUserId||bound.parentChannelId!==channel||!allowedSlackParent(config,channel!,channelMentions)||!ts||!timestamp.test(ts)||rest.length)throw new Error('invalid_slack_destination');
     if(channel!==config.channelId)await assertChannel(api,channel!,config.guildId);
@@ -81,6 +82,7 @@ export function createSlackOutbound(api:SlackApi,config:BotConfig,store:Store,ch
     // Only durable answer rows may carry structured presentation; user text and notices stay literal.
     const part=store.db.prepare("SELECT o.content,r.state FROM outbox o JOIN requests r ON r.id=o.request_id WHERE o.nonce=? AND o.thread_id=? AND o.kind='answer'").get(nonce,threadId) as {content:string;state:string}|undefined;
     const rendered=part&&part.state==='completed'&&part.content===content?slackAnswerPart(content):undefined;
+    if(stopping())throw Error('service_stopping');
     const sent=await post(api,channel,ts,rendered?.body??content,rendered?.context);
     const removeNotice=async(notice:ReturnType<Store['outputParts']>[number])=>{
       const messageId=notice.discordMessageId; // Shared outbox field stores Slack message timestamps.
@@ -101,6 +103,7 @@ export class SlackBot {
   private readonly inFlight=new Set<string>();
   constructor(readonly engine:Engine,readonly api:SlackApi,readonly applicationId:string,private readonly channels:SlackChannelOptions={}){}
   async handle(body:unknown):Promise<void>{
+    if(this.engine.stopping)return;
     if(!body||typeof body!=='object')return;
     const payload=body as Record<string,unknown>,c=this.engine.config;
     if(payload.team_id!==c.guildId||payload.api_app_id!==this.applicationId||!payload.event||typeof payload.event!=='object')return;
@@ -126,7 +129,9 @@ export class SlackBot {
     try{
       if(channelRequest){try{await assertChannel(this.api,channel,c.guildId);}catch{return;}}
       const reply=async(text:string)=>{
+        if(this.engine.stopping)return '';
         if(channelRequest)await assertChannel(this.api,channel,c.guildId);
+        if(this.engine.stopping)return '';
         return post(this.api,channel,root,text);
       };
       if(e.files!==undefined||e.subtype==='file_share'){await reply('슬랙 첨부파일은 아직 지원하지 않습니다. 텍스트로 질문해 주세요.');return;}
@@ -140,6 +145,7 @@ export class SlackBot {
         try{text=await this.readContext(text,channel,e.ts);}
         catch{await reply('맥락 조회를 완료하지 못했습니다. !aside read recent 질문 또는 !aside read thread 타임스탬프 질문 형식과 앱의 채널 읽기 권한을 확인하세요. 일부 본문이나 질문을 임의로 자르지 않으며 합계는 8,000자 이내여야 합니다.');return;}
       }else if(command){await this.command(text,threadId,e.thread_ts!==undefined,reply);return;}
+      if(this.engine.stopping)return;
       const bound=this.engine.store.session(threadId);
       if(!bound){
         if(dm&&e.thread_ts!==undefined){await reply('이 스레드는 관리 중인 Aside 대화가 아닙니다. DM에 새 질문을 보내 주세요.');return;}
@@ -154,6 +160,7 @@ export class SlackBot {
         try{selection=await this.engine.settings.readPreset(name);}
         catch{await reply('Aside 프리셋을 확인하지 못했습니다. Mac에서 Aside 연결을 확인한 뒤 다시 질문해 주세요.');return;}
         // Another first mention may have registered this thread while settings were awaited.
+        if(this.engine.stopping)return;
         if(!this.engine.store.session(threadId))this.engine.store.bindThread({threadId,guildId:c.guildId,parentChannelId:channel,ownerUserId:c.ownerUserId},sourceId,{presetName:name,selection});
       }
       // Translate the verified owner request into the engine's logical thread binding.

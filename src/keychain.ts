@@ -6,7 +6,7 @@ function security(args:string[], input?:string):Promise<string> {
   return new Promise((resolve,reject)=>{
     const p=spawn('/usr/bin/security',args,{shell:false,stdio:['pipe','pipe','pipe'],env:{PATH:'/usr/bin:/bin',HOME:process.env.HOME}});
     let out='';let tooLarge=false;
-    const timer=setTimeout(()=>{p.kill('SIGKILL');reject(new Error('keychain_timeout'));},30_000);
+    const timer=setTimeout(()=>{tooLarge=true;p.kill('SIGKILL');},30_000);
     p.stdout.on('data',(b:Buffer)=>{out+=b.toString();if(out.length>16_384){tooLarge=true;p.kill('SIGKILL');}});
     // Never expose security's diagnostic stream; interactive commands may echo secrets.
     p.stderr.resume();

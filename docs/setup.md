@@ -64,3 +64,37 @@ npm run start:slack        # Slack만, 빌드 후 실행
 `scripts/connect.command`는 Discord 초기 연결 편의 스크립트입니다. 테스트, Keychain 이전, Discord 명령 등록, Aside 연결 진단을 수행하며 Slack을 설정하거나 봇을 상시 실행하지 않습니다.
 
 `npm run doctor`는 Aside 연결 진단과 비공개 보고서 저장을 수행하며 실제 답변을 생성하지 않습니다. 시작·종료·잠금·서비스 설치는 [운영 안내](operations.md)를 참고하세요.
+
+## macOS 메뉴 바 관리자
+
+macOS 13 이상에서 기존 Node 24 런타임과 Xcode 개발 도구로 빌드합니다. 봇이 실행 중인 프로젝트의 `dist`를 덮지 않도록 격리 작업 사본에서 실행하세요. 새 패키지 다운로드는 없습니다.
+
+```sh
+bash scripts/build-menubar-app.sh
+```
+
+산출물은 `build/Aside Bot Menu.app`입니다. 개인 Mac용 ad-hoc 서명이며 외부 배포용 서명·공증은 포함하지 않습니다. Node·Aside·설정·개인 데이터는 번들에 포함하지 않습니다. 앱 배치 권장 경로는 `~/Applications/Aside Bot Menu.app`입니다. 배치와 실행은 별도 운영 단계입니다.
+
+최초 실행에서는 프로젝트 폴더를 선택합니다. 기존 런타임 `~/.aside/runtime/node/bin/node`, 양쪽 로컬 설정, 빌드된 진입점이 필요합니다. 로그인 실행과 봇 자동 시작의 기본값은 각각 꺼짐이며 서로 독립입니다. 로그인 항목은 사용자 토글로만 등록하고 실제 등록·시스템 승인 대기를 구분합니다. 앱 시작 때 설치·빌드·로그인 등록을 수행하지 않습니다.
+
+앱은 두 봇을 함께 시작·정상 중지합니다. 외부 실행은 관찰만 하며 명시적인 인계 메뉴로 정상 종료 후 다시 시작합니다. LaunchAgent나 식별 불가 프로세스는 자동 인계하지 않습니다. 외부 Slack 환경변수를 자동 추출하지 않으므로 인계 안내에서 설정 파일과 앱의 스레드 자동 응답 옵션을 확인하세요. 데이터·레지스트리·잠금은 기존 경로를 유지합니다.
+
+연결 표시는 SDK 상태와 안전 검증·엔진 준비를 모두 확인합니다. 2초 간격의 로컬 응답이 6초 이상 오래되면 확인 불가로 표시합니다. Aside health는 마지막 점검 정보이며 현재 모델 응답을 보장하지 않습니다. 자동 유휴 시스템 잠자기 방지의 희망값과 실제 봇별 적용값을 구분합니다.
+
+2026-10-02 운영 점검에서 개인 Mac에 설치된 메뉴바 앱과 앱의 자식 프로세스로 실행 중인 두 봇을 확인했습니다. 두 봇 모두 실시간 상태 응답이 `connected`이며 초기 검증·엔진 준비·절전 방지가 활성화되어 있었습니다. 이전의 “앱 배치 미수행” 기록은 이 확인으로 정정합니다. 기존 문서에는 격리된 가짜 SDK/CLI·프로세스 검사와 앱 컴파일·서명 검사가 기록되어 있습니다. 실서비스 인계 과정, 로그인 등록·로그인 후 자동 실행, 네트워크 장애, 실제 요청 중단 및 질문·답변 왕복은 이번 운영 점검만으로 검증되지 않았습니다. 근거와 남은 항목은 [프로젝트 개요서](../프로젝트%20개요서.md)에서 관리합니다.
+
+개발 검증은 격리 작업 사본에서 다음 명령으로 반복할 수 있습니다. Swift 검증은 임시 Node 자식과 가짜 서비스 탐색을 사용하며 실제 토큰·봇 연결·LaunchAgent 설정을 읽지 않습니다. 메뉴 추적 run-loop 모드의 타이머와 인계 조사 중 중지 경쟁도 모의 검증합니다. 실제 메뉴 조작과 서비스 인계는 별도 수용 검증입니다.
+
+```sh
+BOT_NODE="$HOME/.aside/runtime/node/bin/node"
+"$BOT_NODE" node_modules/typescript/bin/tsc
+# 모의 검증만 실행: 실제 macOS 절전 assertion을 만드는 두 테스트는 제외합니다.
+"$BOT_NODE" --test --test-skip-pattern='^sleep (prevention creates|controller serializes rapid)' dist/tests/*.test.js
+xcrun swiftc -module-cache-path /tmp/aside-menu-check-cache -parse-as-library \
+  -framework AppKit -framework ServiceManagement -framework Security \
+  macos/AsideBotMenu/ProcessIdentity.swift macos/AsideBotMenu/BotController.swift \
+  tests/menubar-main.swift -o /tmp/aside-menu-checks
+/tmp/aside-menu-checks "$BOT_NODE" "$PWD/dist/src/runtime-control.js"
+```
+
+`npm test` 또는 필터 없는 Node 전체 테스트에는 실제 `caffeinate` assertion을 생성하는 절전 테스트 2개가 포함됩니다. 모의 검증만 허용된 환경에서는 위 제외 필터를 유지하세요. 문서 갱신을 위한 점검에서는 해당 2개와 앱 설치·로그인 등록·실제 봇 전환을 실행하지 않습니다. 이미 설치되어 가동 중인 앱의 상태 확인과 운영 변경은 구분합니다.

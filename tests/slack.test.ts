@@ -12,6 +12,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 const config={ownerUserId:'U12345678',guildId:'T12345678',channelId:'D12345678',applicationId:'A12345678'};
 const message=(ts='1700000000.000001',extra={})=>({api_app_id:config.applicationId,team_id:config.guildId,event:{type:'message',user:config.ownerUserId,channel:config.channelId,channel_type:'im',ts,text:'question',...extra}});
+function pauseExecution(engine:Engine){Reflect.set(engine,"pumping",true);Reflect.set(engine,"delivering",true);}
 function setup(keepQueued=true){
  assert.equal(typeof slack.SlackBot,'function','Slack DM adapter must exist');
  const store=new Store(':memory:');const sent:Array<{method:string;body:Record<string,unknown>}>=[];
@@ -19,7 +20,7 @@ function setup(keepQueued=true){
  const backend:Backend={health:async()=>{},createSession:async()=> 'session-id',runTurn:async()=>({text:'answer'}),stop:async()=>({confirmed:true})};
  const settings=new AsideSettings('/test/aside',async()=>`ASIDE_BOT_JSON:${JSON.stringify({modelCategories:{fast:{provider:'openai-codex',modelId:'gpt-6-luna',thinkingLevel:'max',fastMode:true},standard:{provider:'openai-codex',modelId:'gpt-5.6-sol',thinkingLevel:'medium'},deep:{provider:'openai-codex',modelId:'gpt-6-sol',thinkingLevel:'xhigh'}},defaultModel:{}})}`);
  const engine=new Engine(config,store,backend,slack.createSlackOutbound(api,config,store),undefined,settings);
- if(keepQueued)engine.close(); // Keep submissions queued so authorization and persistence are observable.
+ if(keepQueued)pauseExecution(engine); // Observe accepted requests without running the fixture backend.
  return {store,engine,sent,bot:new slack.SlackBot(engine,api,config.applicationId)};
 }
 
@@ -39,7 +40,7 @@ function channelSetup(enabled=true,channelThreadAutoReply=true){
  };
  const allowed=(parent:string)=>slack.allowedSlackParent(config,parent,enabled);
  const outbound=slack.createSlackOutbound(api,config,t.store,enabled);
- const engine=new Engine(config,t.store,t.engine.backend,outbound,undefined,t.engine.settings,allowed);engine.close();
+ const engine=new Engine(config,t.store,t.engine.backend,outbound,undefined,t.engine.settings,allowed);pauseExecution(engine);
  const bot=new slack.SlackBot(engine,api,config.applicationId,{enabled,botUserId,channelThreadAutoReply});
  return {...t,engine,bot,api,calls,setMember:(v:boolean)=>{member=v;},setFailRead:()=>{failRead=true;},setMessages:(v:unknown[])=>{messages=v;}};
 }
@@ -68,7 +69,7 @@ test('Slack channel auto replies default off and explicit false ignores previous
    const root='1700000000.000001',threadId=`${channel}:${root}`;
    store.bindThread({threadId,guildId:config.guildId,parentChannelId:channel,ownerUserId:config.ownerUserId},`${config.guildId}:${channel}:${root}`);
    store.close();store=new Store(path);
-   const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));engine.close();
+   const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));pauseExecution(engine);
    const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId,...(option===undefined?{}:{channelThreadAutoReply:option})});
    for(const text of ['unmentioned question','!aside status'])await bot.handle(mention('1700000000.000002',{thread_ts:root,type:'message',channel_type:'channel',text}));
    assert.equal(store.pendingCount(),0);assert.equal(t.calls.length,0);
@@ -98,7 +99,7 @@ test('Slack bound-thread followups survive reopening the store and reject other 
   const threadId=`${channel}:1700000000.000001`;
   store.bindThread({threadId,guildId:config.guildId,parentChannelId:channel,ownerUserId:config.ownerUserId},`${config.guildId}:${channel}:1700000000.000001`);
   store.close();store=new Store(path);
-  const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));engine.close();
+  const engine=new Engine(config,store,t.engine.backend,slack.createSlackOutbound(t.api,config,store,true),undefined,t.engine.settings,parent=>slack.allowedSlackParent(config,parent,true));pauseExecution(engine);
   const bot=new slack.SlackBot(engine,t.api,config.applicationId,{enabled:true,botUserId,channelThreadAutoReply:true});
   const reply=(ts:string,extra={})=>mention(ts,{type:'message',channel_type:'channel',thread_ts:'1700000000.000001',text:'plain followup',...extra});
   await Promise.all([bot.handle(reply('1700000000.000002')),bot.handle(reply('1700000000.000002'))]);
@@ -494,4 +495,13 @@ test('Slack token writes use validated stdin and never argv, rejecting injection
  await assert.rejects(funcs.saveSlackToken(service,'bot','xapp-1234567890'));
  await assert.rejects(funcs.saveSlackToken(service,'app','xapp-safe\nquit'));
  await assert.rejects(funcs.readSlackToken('injected;service','bot'));
+});
+
+test('Slack outbound does not post after shutdown during membership lookup',async()=>{
+ const store=new Store(':memory:');const thread=`${channel}:1700000000.000001`;let release!:(value:any)=>void,stopping=false,posts=0;
+ store.bindThread({threadId:thread,guildId:config.guildId,parentChannelId:channel,ownerUserId:config.ownerUserId},'origin');
+ const api:slack.SlackApi=async(method)=>{if(method==='conversations.info')return new Promise(resolve=>release=resolve);posts++;return {ok:true,ts:'1700000000.000002'};};
+ const outbound=slack.createSlackOutbound(api,config,store,true,()=>stopping);const work=outbound.send(thread,'answer','nonce');stopping=true;
+ release({ok:true,channel:{id:channel,is_member:true,is_channel:true,is_im:false,is_mpim:false}});
+ try{await assert.rejects(work);assert.equal(posts,0);}finally{store.close();}
 });

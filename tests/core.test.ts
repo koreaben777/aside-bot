@@ -499,3 +499,34 @@ test('queued attachment survives restart while interrupted preparation never rep
  }finally{engine.close();reopened.close();t.cleanup();}
  }
 });
+
+test('closed engine rejects new turns and never creates after late health',async()=>{
+ let release!:()=>void,created=0;
+ const gate=new Promise<void>(resolve=>release=resolve);
+ const t=setup({health:()=>gate,createSession:async()=>{created++;return 'sid';},runTurn:async()=>({text:'late'}),stop:async()=>({confirmed:false})});
+ try{
+  t.engine.submit(t.turn('before'));t.engine.close();
+  assert.deepEqual(t.engine.submit(t.turn('after')),{kind:'rejected',reason:'service_stopping'});
+  assert.equal(typeof (t.engine as any).waitForIdle,'function');
+  release();await (t.engine as any).waitForIdle();assert.equal(created,0);assert.equal(t.sent.length,0);
+ }finally{release();t.cleanup();}
+});
+test('shutdown preserves uncertain stop and waits for outstanding delivery',async()=>{
+ let release!:()=>void;const gate=new Promise<string>(resolve=>release=()=>resolve('sent'));
+ const t=setup(undefined,{send:()=>gate});
+ try{
+  t.engine.submit(t.turn('request'));await until(()=>t.store.outbox().some(r=>r.state==='sending'));
+  t.engine.close();let idle=false;const waiting=(t.engine as any).waitForIdle().then(()=>idle=true);
+  await new Promise(r=>setTimeout(r,5));assert.equal(idle,false);release();await waiting;assert.equal(idle,true);
+ }finally{release();t.cleanup();}
+});
+
+test('late session creation during shutdown preserves an unconfirmed remote stop',async()=>{
+ let release!:(id:string)=>void;const creation=new Promise<string>(resolve=>release=resolve);let creates=0,turns=0;
+ const t=setup({health:async()=>{},createSession:()=>{creates++;return creation;},runTurn:async()=>{turns++;return {text:'late'};},stop:async()=>({confirmed:false})});
+ try{
+  t.engine.submit(t.turn('late-create'));await until(()=>creates===1);t.engine.close();
+  const stopping=t.engine.stop('thread','owner','guild');release('late-session');assert.equal(await stopping,'uncertain');
+  t.engine.abortLocalWork();await t.engine.waitForIdle();assert.equal(turns,0);assert.equal(t.store.requestBySource('late-create')?.state,'uncertain');assert.equal(t.sent.length,0);
+ }finally{release('late-session');t.cleanup();}
+});

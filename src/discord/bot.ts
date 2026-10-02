@@ -37,9 +37,10 @@ export const asideCommand=new SlashCommandBuilder()
     .addBooleanOption(o=>o.setName('confirm').setDescription('서버 종료 확인').setRequired(true)))
   .addSubcommand(s=>s.setName('help').setDescription('사용법과 접근 제한을 봅니다'));
 
-export function createDiscordOutbound(client:Client,config:BotConfig,store:Store):Outbound {
+export function createDiscordOutbound(client:Client,config:BotConfig,store:Store,stopping:()=>boolean=()=>false):Outbound {
   const titleUpdates=new Map<string,Promise<void>>();
   return {async send(threadId,content,nonce,answerRequestId,replyToMessageId,progressRequestId) {
+    if(stopping())throw Error('service_stopping');
     const bound=store.session(threadId);
     if(!bound || bound.guildId!==config.guildId || bound.parentChannelId!==config.channelId || bound.ownerUserId!==config.ownerUserId) throw new Error('invalid destination');
     const channel=await client.channels.fetch(threadId);
@@ -53,6 +54,7 @@ export function createDiscordOutbound(client:Client,config:BotConfig,store:Store
     const request=answerRequestId===undefined?undefined:store.request(answerRequestId);
     if(answerRequestId!==undefined&&(!request||request.threadId!==threadId||request.state!=='completed'))throw new Error('invalid answer');
     if(progressRequestId!==undefined&&store.request(progressRequestId)?.threadId!==threadId)throw new Error('invalid progress');
+    if(stopping())throw Error('service_stopping');
     const components=request?.actualModel?[answerButtons(request.id)]:[];
     const reply=replyToMessageId?{messageReference:replyToMessageId,failIfNotExists:false}:undefined;
     const sent=await channel.send({content,components,reply,allowedMentions:noMentions,nonce,enforceNonce:true} as Parameters<typeof channel.send>[0]);
@@ -68,13 +70,14 @@ export function createDiscordOutbound(client:Client,config:BotConfig,store:Store
   },setThreadTitle(threadId,title,expectedTitle){
     // Serialize manual and automatic edits so a late AI title cannot overwrite a manual rename.
     const update=(titleUpdates.get(threadId)??Promise.resolve()).catch(()=>{}).then(async()=>{
-      const bound=store.session(threadId);
+      if(stopping())throw Error('service_stopping');
+    const bound=store.session(threadId);
       if(!bound||bound.guildId!==config.guildId||bound.parentChannelId!==config.channelId||bound.ownerUserId!==config.ownerUserId)throw new Error('invalid destination');
       const channel=await client.channels.fetch(threadId,{force:true});
       if(!channel?.isThread()||channel.id!==threadId||channel.guildId!==config.guildId||channel.parentId!==config.channelId)throw new Error('invalid destination');
       if(expectedTitle!==undefined&&channel.name!==expectedTitle)return;
       const normalized=normalizeThreadTitle(title);
-      if(normalized)await channel.setName(normalized,expectedTitle===undefined?'Owner renamed Aside session':'First question summary');
+      if(normalized&&!stopping())await channel.setName(normalized,expectedTitle===undefined?'Owner renamed Aside session':'First question summary');
     });
     titleUpdates.set(threadId,update);
     const cleanup=()=>{if(titleUpdates.get(threadId)===update)titleUpdates.delete(threadId);};
@@ -93,18 +96,21 @@ export function attachDiscordBot(client:Client,engine:Engine,shutdown?:()=>Promi
   client.on('interactionCreate', interaction=>{
     const command=interaction.isChatInputCommand()&&interaction.commandName==='aside';
     const component=(interaction.isButton?.()||interaction.isStringSelectMenu?.())&&'customId' in interaction&&interaction.customId.startsWith('aside:');
+    if(engine.stopping)return;
     if((!command&&!component)||inFlight.has(interaction.id))return;
     inFlight.add(interaction.id);
     const work=command?handleCommand(interaction as ChatInputCommandInteraction,engine,shutdown):handleAnswerAction(interaction as ButtonInteraction|StringSelectMenuInteraction,engine);
-    void work.catch(async()=>{
+    void engine.trackWork(work.catch(async()=>{
+      if(engine.stopping)return;
       try {
         const payload={content:'명령을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.',allowedMentions:noMentions};
         if(interaction.deferred || interaction.replied) await interaction.editReply(payload);
         else await interaction.reply({...payload,flags:MessageFlags.Ephemeral});
       } catch { /* never log raw errors, prompts, or credentials */ }
-    }).finally(()=>inFlight.delete(interaction.id));
+    }).finally(()=>inFlight.delete(interaction.id)));
   });
   client.on('messageCreate',message=>{
+    if(engine.stopping)return;
     if(message.author.bot || message.webhookId || !engine.authorized(message.author.id,message.guildId)) return;
     if(!message.channel.isThread() || message.channel.parentId!==config.channelId || message.channel.guildId!==config.guildId) return;
     if(!engine.store.session(message.channelId)) return;
@@ -133,7 +139,7 @@ async function handleCommand(interaction:ChatInputCommandInteraction,engine:Engi
     }
     if(!shutdown){await interaction.reply({content:'이 실행에서는 서버 종료 기능을 사용할 수 없습니다.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});return;}
     await interaction.reply({content:'봇 서버 종료 요청을 받았습니다. 실행 중인 작업에 중단을 요청하고 대화 기록을 보존합니다. Aside 작업의 완전 종료를 보장하지는 않습니다. 다시 시작하려면 Mac에서 시작 커맨드를 실행해 주세요.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});
-    await shutdown();return;
+    void shutdown();return;
   }
   if(sub==='rename'){
     if(!isManaged){await interaction.reply({content:'관리 중인 Aside 스레드 안에서 `/aside rename`을 사용해 주세요.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});return;}
@@ -236,12 +242,15 @@ function answerButtons(requestId:number):ActionRowBuilder<ButtonBuilder>{
 }
 
 async function startConversation(interaction:ChatInputCommandInteraction|StringSelectMenuInteraction,engine:Engine,question:string,name:PresetName,selection:ModelSelection,origin?:AnswerTarget):Promise<void>{
+  if(engine.stopping)return;
   const config=engine.config,existing=engine.store.sessionByOrigin(interaction.id);
   if(existing){await interaction.editReply({content:`이미 생성한 스레드: <#${existing.threadId}>`,allowedMentions:noMentions});return;}
   if(engine.store.hasUncertain()||engine.store.pendingCount()>=5){await interaction.editReply({content:'실행 상태가 불확실하거나 대기열이 가득 차 새 대화를 시작하지 못했습니다.',allowedMentions:noMentions});return;}
   const destination=await interaction.client.channels.fetch(config.channelId);
   if(!destination||destination.type!==ChannelType.GuildText||destination.guildId!==config.guildId)throw new Error('invalid configured channel');
+  if(engine.stopping)return;
   const thread=await destination.threads.create({name:origin?`Aside 비교 ${new Date().toISOString().replace('T',' ').slice(0,16)}`:normalizeThreadTitle(question)??'Aside 새 대화',type:ChannelType.PublicThread,autoArchiveDuration:1440,reason:'Owner-initiated Aside session'});
+  if(engine.stopping){await thread.delete().catch(()=>{});return;}
   try{engine.store.bindThread({threadId:thread.id,guildId:config.guildId,parentChannelId:config.channelId,ownerUserId:config.ownerUserId},interaction.id,{presetName:name,selection,comparisonRequestId:origin?.request.id});}
   catch{await thread.delete().catch(()=>{});throw new Error('thread binding failed');}
   const result=engine.submit({sourceId:interaction.id,userId:interaction.user.id,guildId:interaction.guildId,channelId:thread.id,content:question},

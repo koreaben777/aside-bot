@@ -61,3 +61,15 @@ tests/slack-presentation.test.ts
 tests/slack.test.ts
 tests/start-command.test.ts
 tsconfig.json
+macos/AsideBotMenu/App.swift
+macos/AsideBotMenu/BotController.swift
+macos/AsideBotMenu/ProcessIdentity.swift
+macos/AsideBotMenu/Info.plist
+macos/AsideBotMenu/Resources/aside-bot-teal-violet.png
+scripts/build-menubar-app.sh
+scripts/prepare-bots.ts
+src/runtime-control.ts
+tests/runtime-control.test.ts
+tests/menubar-lifecycle.test.ts
+tests/menubar-main.swift
+프로젝트 개요서.md

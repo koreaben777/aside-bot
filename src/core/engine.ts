@@ -13,6 +13,11 @@ type Phase='preparing'|'health'|'creating'|'running';
 type Active={requestId:number;threadId:string;sourceId:string;phase:Phase;controller:AbortController;createPromise:Promise<string>|null;backendId:string|null;progressTimer:NodeJS.Timeout|null;stopResolver:(()=>void)|null};
 
 export class Engine {
+  private readonly work=new Set<Promise<unknown>>();
+  get stopping():boolean {return this.closed;}
+  trackWork<T>(promise:Promise<T>):Promise<T>{this.work.add(promise);void promise.then(()=>this.work.delete(promise),()=>this.work.delete(promise));return promise;}
+  async waitForIdle():Promise<void>{while(this.work.size)await Promise.allSettled([...this.work]);await this.stopInFlight;}
+  abortLocalWork():void {this.active?.controller.abort();this.active?.stopResolver?.();}
   private pumping=false;
   private delivering=false;
   private active:Active|null=null;
@@ -45,6 +50,7 @@ export class Engine {
     return !!s && s.guildId===this.config.guildId && this.allowedParent(s.parentChannelId) && s.ownerUserId===this.config.ownerUserId && (parentId===undefined || parentId===s.parentChannelId) && (guildId===undefined || guildId===this.config.guildId);
   }
   submit(turn:InboundTurn,options:{publishQuestion?:boolean;publishQueueNotice?:boolean;inputKind?:RequestRow['inputKind'];referenceRequestId?:number;onlyIfLatest?:number;comparisonOrigin?:{threadId:string;messageId:string}}={}):SubmitResult {
+    if(this.closed)return {kind:'rejected',reason:'service_stopping'};
     if(turn.isBot || turn.isDm || !this.authorized(turn.userId,turn.guildId)) return {kind:'rejected',reason:'unauthorized'};
     const s=this.store.session(turn.channelId);
     if(!s || s.guildId!==turn.guildId || !this.allowedParent(s.parentChannelId) || s.ownerUserId!==turn.userId) return {kind:'rejected',reason:'invalid_channel'};
@@ -78,7 +84,7 @@ export class Engine {
     if(outcome.kind==='queued') { this.kick();void this.flushOutbox(); }
     return outcome;
   }
-  private kick():void { if(!this.closed && !this.pumping) void this.pump(); }
+  private kick():void { if(!this.closed && !this.pumping) void this.trackWork(this.pump()); }
   private failure(id:number,threadId:string,code:string,message='요청이 실패했습니다. 서비스 상태를 확인한 뒤 다시 시도해 주세요.'):void {
     if(this.store.transition(id,'running','failed',code)) {
       this.store.addOutput(id,threadId,[message]);
@@ -119,7 +125,7 @@ export class Engine {
           // A health failure is known pre-execution and never launches work.
           try { await this.backend.health(); }
           catch { this.failure(req.id,req.threadId,'health_failed');continue; }
-          if(this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
+          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
           let backendId=this.store.session(req.threadId)?.backendId;
           if(!backendId) {
             active.phase='creating';
@@ -128,14 +134,14 @@ export class Engine {
             this.store.setBackendId(req.threadId,backendId);
           }
           active.backendId=backendId;
-          if(this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
+          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
           active.phase='running';
           const startedAt=Date.now();
           const elapsed=()=>{
             const seconds=Math.max(0,Math.floor((Date.now()-startedAt)/1000));
             return `${String(Math.floor(seconds/60)).padStart(2,'0')}분 ${String(seconds%60).padStart(2,'0')}초`;
           };
-          const task=this.backend.runTurn(backendId,prompt,active.controller.signal,req.selection,req.inputKind==='initial'?{generateThreadTitle:true}:undefined);
+          const task=this.trackWork(this.backend.runTurn(backendId,prompt,active.controller.signal,req.selection,req.inputKind==='initial'?{generateThreadTitle:true}:undefined));
           if(this.outbound.progressNotices!==false){active.progressTimer=setInterval(()=>{
             if(this.active!==active || this.store.request(req.id)?.state!=='running') return;
             // Informational only. No fabricated percentage, tool state, or backend claims.
@@ -150,7 +156,7 @@ export class Engine {
           ]);
           if(active.progressTimer)clearInterval(active.progressTimer);
           active.progressTimer=null;
-          if(outcome.kind==='stopped') continue;
+          if(outcome.kind==='stopped'||this.closed) continue;
           if(outcome.answer.model!==undefined&&outcome.answer.model!==`${req.selection.provider}/${req.selection.modelId}`)throw new ExecutionUncertainError('model_mismatch');
           const parts=this.outbound.formatAnswer?.(outcome.answer,elapsed())??splitOutput(`(${elapsed()} 경과)\n\n${outcome.answer.text||'(답변 내용이 없습니다.)'}`);
           if(this.store.transition(req.id,'running','completed')) {
@@ -158,7 +164,7 @@ export class Engine {
             void this.flushOutbox();
             if(req.inputKind==='initial'&&outcome.answer.threadTitle&&this.outbound.setThreadTitle){
               // Title updates are best effort and must never hold up answer delivery or the queue.
-              void Promise.resolve().then(()=>this.outbound.setThreadTitle!(req.threadId,outcome.answer.threadTitle!,normalizeThreadTitle(req.prompt)??'Aside 새 대화')).catch(()=>{});
+              void this.trackWork(Promise.resolve().then(()=>this.closed?undefined:this.outbound.setThreadTitle!(req.threadId,outcome.answer.threadTitle!,normalizeThreadTitle(req.prompt)??'Aside 새 대화')).catch(()=>{}));
             }
           }
         } catch(error) {
@@ -175,6 +181,7 @@ export class Engine {
           if(active.progressTimer) clearInterval(active.progressTimer);
           // Never release the global pump while an in-flight stop is unconfirmed.
           if(this.stopInFlight && this.active===active) await this.stopInFlight;
+          if(this.closed&&this.store.request(req.id)?.state==='running')this.uncertain(req.id,'shutdown_pending');
           this.active=null;
         }
       }
@@ -240,7 +247,8 @@ export class Engine {
     const counts=this.store.counts(threadId);
     return {...counts,deliveryUncertain:this.store.deliveryUncertainCount(threadId),blocked:this.store.hasUncertain() || !!threadId && !!this.store.session(threadId)?.blocked};
   }
-  async flushOutbox():Promise<void> {
+  flushOutbox():Promise<void> {return this.trackWork(this.deliverOutbox());}
+  private async deliverOutbox():Promise<void> {
     if(this.delivering || this.closed) return;
     this.delivering=true;
     try {

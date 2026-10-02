@@ -8,6 +8,8 @@ macOS Keychain, `caffeinate`, `lockf`, Node.js 내장 SQLite를 사용합니다.
 
 ## 지원 기능
 
+개인 Mac용 메뉴바 앱 이름은 **Aside Bot Menu**입니다. 앱 아이콘은 기존 Slack 봇용 컬러스왑 이미지 `macos/AsideBotMenu/Resources/aside-bot-teal-violet.png`를 재사용합니다. `scripts/build-menubar-app.sh`가 원본을 macOS 아이콘 크기별로 변환하고 `AppIcon.icns`로 패키징·서명합니다. 메뉴바의 연결·중지·경고 상태 심볼은 별개입니다. 운영 중인 봇이 있으면 격리 작업 사본에서 빌드하세요.
+
 | 기능 | Discord | Slack |
 |---|---|---|
 | 새 대화 | 지정 비공개 채널의 `/aside new` 또는 `/aside ask` | 봇 DM의 새 질문, 활성화된 채널의 직접 멘션 |

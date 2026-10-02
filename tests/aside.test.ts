@@ -356,3 +356,13 @@ test('bootstrap and fresh answer validate the selected model rather than fixed L
  assert.equal(Reflect.apply(finalAnswer,null,[rows,new Set(),selection]),'Selected answer');
  assert.throws(()=>Reflect.apply(finalAnswer,null,[turnRows('new','Wrong answer','response'),new Set(),selection]),ExecutionUncertainError);
 });
+
+test('CLI shutdown waits for owned children and forbids later spawns',async()=>{
+ const {execFile}=await import('node:child_process');const {promisify}=await import('node:util');
+ const {pathToFileURL}=await import('node:url');const {resolve}=await import('node:path');
+ const code=`import assert from 'node:assert/strict';import {runAsideCli,shutdownAsideCliChildren} from ${JSON.stringify(pathToFileURL(resolve('dist/src/aside/backend.js')).href)};
+ const pending=runAsideCli(process.execPath,['-e','setInterval(()=>{},1000)'],60000);const settled=pending.catch(()=>{});
+ await new Promise(r=>setTimeout(r,100));await shutdownAsideCliChildren();await settled;
+ await assert.rejects(runAsideCli(process.execPath,['-e','process.exit(0)'],1000));`;
+ await promisify(execFile)(process.execPath,['--input-type=module','-e',code],{timeout:5000});
+});

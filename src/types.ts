@@ -108,4 +108,4 @@ export interface Outbound {
 export type SubmitResult =
   | { kind: 'queued'; requestId: number; position: number }
   | { kind: 'duplicate'; requestId: number; state: RequestState }
-  | { kind: 'rejected'; reason: 'unauthorized' | 'invalid_channel' | 'attachments' | 'attachment_limits' | 'attachment_format' | 'attachment_capacity' | 'empty' | 'too_long' | 'queue_full' | 'blocked' | 'stale' };
+  | { kind: 'rejected'; reason: 'service_stopping' | 'unauthorized' | 'invalid_channel' | 'attachments' | 'attachment_limits' | 'attachment_format' | 'attachment_capacity' | 'empty' | 'too_long' | 'queue_full' | 'blocked' | 'stale' };

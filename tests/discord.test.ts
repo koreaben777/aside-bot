@@ -160,3 +160,15 @@ test('elapsed progress replaces prior notices and final cleanup never retries a 
   }finally{release();releaseProgress();finishTurn();engine.close();await until(()=>!Reflect.get(engine,'pumping')&&!Reflect.get(engine,'delivering'));store.close();}
  });
 });
+
+test('outbound does not send after shutdown while channel lookup was pending',async()=>{
+ let release!:(value:any)=>void,stopping=false,sends=0;
+ const store=new Store(':memory:');const c={ownerUserId:'owner',guildId:'guild',channelId:'parent'};
+ store.bindThread({threadId:'thread',guildId:'guild',parentChannelId:'parent',ownerUserId:'owner'},'origin');
+ const parent={type:0,guildId:'guild',guild:{roles:{fetch:async()=>new Collection()}},permissionOverwrites:{cache:new Collection([['guild',{id:'guild',type:0,allow:{bitfield:0n},deny:{bitfield:1024n}}]])}};
+ const client={user:{id:'bot'},channels:{fetch:(id:string)=>id==='thread'?new Promise(resolve=>release=resolve):Promise.resolve(parent)}} as unknown as Client;
+ const outbound=createDiscordOutbound(client,c,store,()=>stopping);
+ const work=outbound.send('thread','answer','nonce');stopping=true;
+ release({isThread:()=>true,guildId:'guild',parentId:'parent',id:'thread',send:async()=>{sends++;return {id:'sent'};}});
+ try{await assert.rejects(work);assert.equal(sends,0);}finally{store.close();}
+});

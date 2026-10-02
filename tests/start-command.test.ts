@@ -14,7 +14,10 @@ test('start command opens Aside, waits for its connection, and refuses to start 
   await mkdir(join(dir,'scripts'));await mkdir(join(dir,'dist/src'),{recursive:true});
   await copyFile('scripts/start.command',join(dir,'scripts/start.command'));
   await copyFile('scripts/start-bots.mjs',join(dir,'scripts/start-bots.mjs'));
-  await mkdir(join(dir,'dist/src/slack'));
+  await mkdir(join(dir,'dist/src/slack'));await mkdir(join(dir,'dist/scripts'));
+  await copyFile('dist/scripts/prepare-bots.js',join(dir,'dist/scripts/prepare-bots.js'));
+  await copyFile('dist/src/slack/config.js',join(dir,'dist/src/slack/config.js'));
+  await writeFile(join(dir,'config.slack.local.json'),JSON.stringify({ownerUserId:'U12345678',teamId:'T12345678',applicationId:'A12345678'}));
   await symlink(resolve('node_modules'),join(dir,'node_modules'));
   for(const name of ['config.js','aside'])await symlink(resolve('dist/src',name),join(dir,'dist/src',name));
   await writeFile(join(dir,'package.json'),'{"type":"module"}');
@@ -23,12 +26,12 @@ test('start command opens Aside, waits for its connection, and refuses to start 
   }
   const cli=join(dir,'cli');
   await writeFile(cli,`#!${process.execPath}
-import {appendFileSync,existsSync,readFileSync} from 'node:fs';
+import {appendFileSync,existsSync,readFileSync,writeFileSync} from 'node:fs';
 if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['session','list','--account','u0']))process.exit(2);
 appendFileSync('events','probe\\n');
 const scenario=readFileSync('scenario','utf8'),count=readFileSync('events','utf8').split('probe\\n').length-1;
 if(!existsSync('opened')||scenario==='never-ready'||(scenario==='closed'&&count<2))process.exit(1);
-console.log('No sessions.');
+if(scenario==='cancel-preparation'){writeFileSync('cli-pid',String(process.pid));setInterval(()=>{},1000);}else console.log('No sessions.');
 `,{mode:0o700});
   await writeFile(join(dir,'config.local.json'),JSON.stringify({ownerUserId:'111111111111111111',guildId:'222222222222222222',channelId:'333333333333333333',applicationId:'444444444444444444',cliPath:cli,asideAccount:'u0',asideModel:'openai-codex/gpt-6-luna',dataDir:join(dir,'data')}));
   await writeFile(join(dir,'open.mjs'),`import {appendFileSync,readFileSync,writeFileSync} from 'node:fs';
@@ -61,6 +64,15 @@ syncBuiltinESMExports();`);
     else assert.ok(events.includes('probe\n'));
    }
   }
+  await writeFile(join(dir,'scenario'),'cancel-preparation');
+  const preparation=spawn(process.execPath,['--import',pathToFileURL(preload).href,'dist/scripts/prepare-bots.js'],{cwd:dir,env,stdio:'ignore'});
+  const preparationClosed=new Promise(resolve=>preparation.once('close',(code,signal)=>resolve({code,signal})));
+  try{
+   const deadline=Date.now()+5000;while(!await readFile(join(dir,'cli-pid'),'utf8').then(()=>true,()=>false)){assert.ok(Date.now()<deadline);await delay(10);}
+   const pid=Number(await readFile(join(dir,'cli-pid'),'utf8'));preparation.kill('SIGTERM');
+   assert.deepEqual(await preparationClosed,{code:0,signal:null});
+   assert.throws(()=>process.kill(pid,0),(e:any)=>e.code==='ESRCH');
+  }finally{preparation.kill('SIGTERM');await preparationClosed;const fixturePid=Number(await readFile(join(dir,'cli-pid'),'utf8').catch(()=>'0'));if(fixturePid>0)try{process.kill(fixturePid,'SIGTERM');}catch{}}
  }finally{await rm(dir,{recursive:true,force:true});}
 });
 

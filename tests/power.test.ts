@@ -14,6 +14,17 @@ test('sleep prevention creates a macOS idle sleep assertion and releases it', {s
   assert.fail(`own idle sleep assertion did not become ${expected}`);
  };
  const release=await power.preventIdleSleep();
- try{await waitFor(true);}finally{release();}
+ try{await waitFor(true);}finally{await release();}
  await waitFor(false);
+});
+
+
+test('sleep controller serializes rapid toggles and repeated close', {skip:process.platform!=='darwin'},async()=>{
+ const modulePath='../src/power.js';const power=await import(modulePath) as any;
+ assert.equal(typeof power.createSleepController,'function');
+ const c=power.createSleepController();
+ assert.equal(c.active(),false);
+ try{assert.deepEqual(await Promise.all([c.set(true),c.set(true),c.set(false),c.set(true)]),[true,true,false,true]);assert.equal(c.active(),true);assert.equal(await c.set(false),false);assert.equal(c.active(),false);}
+ finally{await c.close();await c.close();}
+ assert.equal(await c.set(true),false);
 });
