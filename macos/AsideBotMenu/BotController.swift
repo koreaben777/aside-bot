@@ -130,6 +130,8 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
  private var instanceIDs:[Platform:String]=[:],directories:[Platform:URL]=[:]
  private var preparing:Process?,starting=false,stopping=false,refreshing=false,startCancelled=false
  private var stopTask:Task<Void,Error>?
+ private enum Recovery {case available,pending,spent}
+ private var recovery=Recovery.spent
  private(set) var conflict=false
  init(projectURL:URL,nodeURL:URL,preventSleep:Bool,logDirectory:URL?=nil,discoverServices:@escaping ServiceDiscovery={project in try await Task.detached{try findConflictingServices(project:project)}.value}){self.discoverServices=discoverServices;self.logDirectory=logDirectory;self.projectURL=projectURL.resolvingSymlinksInPath();self.nodeURL=nodeURL.resolvingSymlinksInPath();self.preventSleep=preventSleep}
  private var environment:[String:String]{
@@ -195,10 +197,16 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
    }
    if let channel=channels[platform] {do{try accept(await channel.request(["op":"status"]),platform:platform)}catch{await channel.close();if processes[platform]==nil{channels[platform]=nil;instanceIDs[platform]=nil};if isStale(lastReply:bots[platform]?.lastReplyUptime,now:ProcessInfo.processInfo.systemUptime){bots[platform]?.phase="unknown"};bots[platform]?.safeErrorCode=(error as? ManagerError)?.code ?? "control_unavailable"}}
   }
+  if recovery == .pending,!conflict,!starting,!stopping,processes.isEmpty {
+   recovery = .spent
+   try? await startBoth(recovering:true)
+  }
  }
  func invalidate(){for platform in Platform.allCases where bots[platform]?.phase != "stopped"{bots[platform]?.phase="unknown";bots[platform]?.lastReplyUptime=nil};onChange?()}
- func startBoth() async throws {
+ func startBoth() async throws {try await startBoth(recovering:false)}
+ private func startBoth(recovering:Bool) async throws {
   guard !starting,!stopping,processes.isEmpty else{throw ManagerError("service_already_running")}
+  if !recovering{recovery = .available}
   starting=true;startCancelled=false;defer{starting=false;onChange?()}
   do{
    try paths();guard (try await discoverServices(projectURL)).isEmpty else{throw ManagerError("launchagent_conflict")}
@@ -230,12 +238,23 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
  }
  private func childExited(_ platform:Platform) async {
   guard let child=processes[platform],!child.isRunning else{return}
-  await channels[platform]?.close();channels[platform]=nil;processes[platform]=nil;identities[platform]=nil;instanceIDs[platform]=nil
-  bots[platform]=BotViewState(phase:"stopped",safeErrorCode:stopping ? nil:"process_exited");appendSafeEvent(platform:platform,code:"stopped",stage:"shutdown",folder:logDirectory);onChange?()
+  let channel=channels.removeValue(forKey:platform)
+  processes[platform]=nil;identities[platform]=nil;instanceIDs[platform]=nil
+  let expected=stopping || startCancelled
+  if !expected,!starting,recovery == .available,child.terminationStatus != 0,bots[platform]?.snapshot?.engineStarted==true {
+   recovery = .pending
+  }
+  let code=expected ? nil:"process_exited"
+  bots[platform]=BotViewState(phase:"stopped",safeErrorCode:code);appendSafeEvent(platform:platform,code:code ?? "stopped",stage:"shutdown",folder:logDirectory);onChange?()
   if !stopping && !starting && !processes.isEmpty {await stopBothIgnoringFailure()}
+  await channel?.close()
  }
- private func stopBothIgnoringFailure() async {try? await stopBoth()}
+ private func stopBothIgnoringFailure() async {try? await stopManagedBots()}
  func stopBoth() async throws {
+  recovery = .spent
+  try await stopManagedBots()
+ }
+ private func stopManagedBots() async throws {
   if let task=stopTask{return try await task.value}
   stopping=true;startCancelled=true;preparing?.terminate();for platform in processes.keys{bots[platform]?.phase="stopping"};onChange?()
   let task=Task{@MainActor in

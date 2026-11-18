@@ -60,7 +60,7 @@ import Darwin
   c=await startRuntimeControl({dataDir:dir,platform,ownerToken:boot.token,initialSleep:boot.sleepEnabled,setSleep:async enabled=>enabled,shutdown:stop});
   await c.waitForOwner();c.publish({phase:'connected',stage:'engine',preflightPassed:true,engineStarted:true});
   process.on('SIGTERM',()=>void stop());
-  setInterval(()=>{if(existsSync('crash-slack')&&platform==='slack')process.exit(1);},10);
+  setInterval(async()=>{if(existsSync('crash-slack')&&platform==='slack'){await unlink('crash-slack');process.exit(1);}},10);
   """
   for file in ["dist/src/main.js","dist/src/slack/main.js"]{try Data(script.utf8).write(to:project.appendingPathComponent(file))}
   let c=BotController(projectURL:project,nodeURL:node,preventSleep:false,logDirectory:logs,discoverServices:{_ in []})
@@ -83,9 +83,21 @@ import Darwin
   // Stopping during preparation must prevent late startup, even if stop initially has no child.
   let late=Task{try await c.startBoth()};await Task.yield();try await c.stopBoth();do{try await late.value;assertionFailure("cancelled start succeeded")}catch{}
   assert(c.bots.values.allSatisfy{$0.ownership != "managed" || $0.phase=="stopped"})
-  try await c.startBoth();try Data().write(to:project.appendingPathComponent("crash-slack"))
+  try await c.startBoth()
+  await c.refresh()
+  let previousPID=c.bots[.slack]?.snapshot?.pid
+  let crash=project.appendingPathComponent("crash-slack")
+  try Data().write(to:crash)
+  for _ in 0..<200 {
+   await c.refresh()
+   if let state=c.bots[.slack],state.phase=="connected",state.snapshot?.pid != previousPID{break}
+   try await Task.sleep(nanoseconds:10000000)
+  }
+  assert(c.bots[.slack]?.phase=="connected" && c.bots[.slack]?.snapshot?.pid != previousPID, "unexpected exit did not recover")
+  try Data().write(to:crash)
   for _ in 0..<200{if c.bots.values.allSatisfy({$0.phase=="stopped"}){break};try await Task.sleep(nanoseconds:10000000)}
-  assert(c.bots.values.allSatisfy{$0.phase=="stopped"});try fm.removeItem(at:project.appendingPathComponent("crash-slack"))
+  await c.refresh()
+  assert(c.bots.values.allSatisfy{$0.phase=="stopped"}, "a second exit must not restart the bot")
   // A live foreign PID in a service lock must block before preparation or spawn.
   try Data(String(getpid()).utf8).write(to:data.appendingPathComponent("service.lock"))
   do{try await c.startBoth();assertionFailure("foreign lock accepted")}catch{}
