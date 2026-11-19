@@ -1,5 +1,6 @@
+import {DeliveryFailure} from '../types.js';
 import { AttachmentFiles, AttachmentError, ATTACHMENT_MARKER, validateAttachments, attachmentErrorMessage } from '../attachments.js';
-import { BackendFailureError, ExecutionUncertainError, type Backend, type BotConfig, type InboundTurn, type Outbound, type SubmitResult } from '../types.js';
+import { BackendFailureError, CompletedOutputError, ExecutionUncertainError, type Backend, type BotConfig, type InboundTurn, type Outbound, type SubmitResult } from '../types.js';
 import { Store, type RequestRow } from '../store.js';
 import { splitOutput } from './split.js';
 import {normalizeThreadTitle} from './thread-title.js';
@@ -23,16 +24,25 @@ export class Engine {
   private active:Active|null=null;
   private stopInFlight:Promise<void>|null=null;
   private closed=false;
+  private connected=true;
   private deliveryTimer:NodeJS.Timeout|null=null;
   constructor(readonly config:BotConfig,readonly store:Store,readonly backend:Backend,readonly outbound:Outbound,readonly attachments?:AttachmentFiles,readonly settings?:AsideSettings,private readonly parentChannelPolicy?:(channelId:string)=>boolean) {}
+  setConnected(connected:boolean):void {
+    this.connected=connected;
+    if(connected&&!this.closed){this.kick();void this.flushOutbox();}
+  }
   private allowedParent(channelId:string):boolean {return this.parentChannelPolicy?.(channelId)??channelId===this.config.channelId;}
   start():void {
     if(this.closed) return;
-    this.kick();void this.flushOutbox();
+    this.maintainQueue();this.kick();void this.flushOutbox();
     if(!this.deliveryTimer) {
-      this.deliveryTimer=setInterval(()=>{void this.flushOutbox();},30_000);
+      this.deliveryTimer=setInterval(()=>{this.maintainQueue();this.kick();void this.flushOutbox();},30_000);
       this.deliveryTimer.unref();
     }
+  }
+  maintainQueue():void {
+    if(this.closed)return;
+    for(const sourceId of this.store.reconcileWaiting())try{this.attachments?.discard(sourceId);}catch{}
   }
   close():void {
     this.closed=true;
@@ -62,9 +72,10 @@ export class Engine {
       if(!this.attachments) return {kind:'rejected',reason:'attachments'};
       try { validateAttachments(refs); } catch(error) { return {kind:'rejected',reason:attachmentReason(error)}; }
     }
+    this.maintainQueue();
     const duplicate=this.store.requestBySource(turn.sourceId);
     if(duplicate) return {kind:'duplicate',requestId:duplicate.id,state:duplicate.state};
-    if(this.store.hasUncertain()||s.blocked) return {kind:'rejected',reason:'blocked'};
+    if(this.store.hasGlobalUncertainty()||s.blocked) return {kind:'rejected',reason:'blocked'};
     if(this.store.pendingCount()>=MAX_PENDING) return {kind:'rejected',reason:'queue_full'};
     let staged=false;
     if(refs?.length){
@@ -84,7 +95,7 @@ export class Engine {
     if(outcome.kind==='queued') { this.kick();void this.flushOutbox(); }
     return outcome;
   }
-  private kick():void { if(!this.closed && !this.pumping) void this.trackWork(this.pump()); }
+  private kick():void { if(!this.closed && this.connected && !this.pumping) void this.trackWork(this.pump()); }
   private failure(id:number,threadId:string,code:string,message='요청이 실패했습니다. 서비스 상태를 확인한 뒤 다시 시도해 주세요.'):void {
     if(this.store.transition(id,'running','failed',code)) {
       this.store.addOutput(id,threadId,[message]);
@@ -93,12 +104,14 @@ export class Engine {
   }
   private uncertain(id:number,code:string):void {
     this.store.transition(id,'running','uncertain',code);
+    if(!this.closed){this.maintainQueue();void this.flushOutbox();}
   }
   private async pump():Promise<void> {
     if(this.pumping) return;
     this.pumping=true;
     try {
-      while(!this.closed && !this.store.hasUncertain()) {
+      while(!this.closed && this.connected && !this.store.hasGlobalUncertainty()) {
+        this.maintainQueue();
         const req=this.store.nextQueued();
         if(!req) break;
         if(!this.store.startRequest(req.id)) continue;
@@ -120,12 +133,14 @@ export class Engine {
               this.failure(req.id,req.threadId,code,attachmentErrorMessage(code));continue;
             }
             if(active.controller.signal.aborted||this.closed||this.store.request(req.id)?.state!=='running')continue;
+            if(!this.connected){this.store.deferUnsubmitted(req.id);continue;}
           }
           active.phase='health';
           // A health failure is known pre-execution and never launches work.
           try { await this.backend.health(); }
-          catch { this.failure(req.id,req.threadId,'health_failed');continue; }
-          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
+          catch { if(!this.connected&&!this.closed)this.store.deferUnsubmitted(req.id);else this.failure(req.id,req.threadId,'health_failed');continue; }
+          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasGlobalUncertainty()) continue;
+          if(!this.connected){this.store.deferUnsubmitted(req.id);continue;}
           let backendId=this.store.session(req.threadId)?.backendId;
           if(!backendId) {
             active.phase='creating';
@@ -134,14 +149,16 @@ export class Engine {
             this.store.setBackendId(req.threadId,backendId);
           }
           active.backendId=backendId;
-          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasUncertain()) continue;
+          if(this.closed || this.store.request(req.id)?.state!=='running' || this.store.hasGlobalUncertainty()) continue;
+          if(!this.connected){this.store.deferUnsubmitted(req.id);continue;}
           active.phase='running';
           const startedAt=Date.now();
           const elapsed=()=>{
             const seconds=Math.max(0,Math.floor((Date.now()-startedAt)/1000));
             return `${String(Math.floor(seconds/60)).padStart(2,'0')}분 ${String(seconds%60).padStart(2,'0')}초`;
           };
-          const task=this.trackWork(this.backend.runTurn(backendId,prompt,active.controller.signal,req.selection,req.inputKind==='initial'?{generateThreadTitle:true}:undefined));
+          const options={...(req.inputKind==='initial'?{generateThreadTitle:true}:{}),...(binding.bootstrapSelection?{bootstrapSelection:binding.bootstrapSelection}:{})};
+          const task=this.trackWork(this.backend.runTurn(backendId,prompt,active.controller.signal,req.selection,Object.keys(options).length?options:undefined,()=>this.connected));
           if(this.outbound.progressNotices!==false){active.progressTimer=setInterval(()=>{
             if(this.active!==active || this.store.request(req.id)?.state!=='running') return;
             // Informational only. No fabricated percentage, tool state, or backend claims.
@@ -158,7 +175,9 @@ export class Engine {
           active.progressTimer=null;
           if(outcome.kind==='stopped'||this.closed) continue;
           if(outcome.answer.model!==undefined&&outcome.answer.model!==`${req.selection.provider}/${req.selection.modelId}`)throw new ExecutionUncertainError('model_mismatch');
-          const parts=this.outbound.formatAnswer?.(outcome.answer,elapsed())??splitOutput(`(${elapsed()} 경과)\n\n${outcome.answer.text||'(답변 내용이 없습니다.)'}`);
+          let parts:string[];
+          try{parts=this.outbound.formatAnswer?.(outcome.answer,elapsed())??splitOutput(`(${elapsed()} 경과)\n\n${outcome.answer.text||'(답변 내용이 없습니다.)'}`);}
+          catch{throw new CompletedOutputError('output_format_failed');}
           if(this.store.transition(req.id,'running','completed')) {
             this.store.addOutput(req.id,req.threadId,parts,'answer',outcome.answer.model);
             void this.flushOutbox();
@@ -171,8 +190,14 @@ export class Engine {
           // Generic run/create errors, including timeouts, have unknown remote state.
           // Only an explicit adapter guarantee permits a confirmed safe failure.
           if(this.store.request(req.id)?.state==='running') {
-            if(error instanceof BackendFailureError && error.safeToRetry) {
-              if(error.code==='session_unavailable')this.failure(req.id,req.threadId,'session_unavailable','연결된 Aside 세션을 찾을 수 없습니다. 새 대화에서 질문해 주세요. 이 질문은 Aside에 제출하지 않았습니다.');
+            if(error instanceof CompletedOutputError) {
+              this.failure(req.id,req.threadId,`completed_output_${error.code}`,'Aside 실행은 완료됐지만 답변을 정리하지 못했습니다. 이 질문은 다시 실행하지 않았습니다. 운영자 확인이 필요합니다.');
+            } else if(error instanceof BackendFailureError && error.safeToRetry) {
+              if(error.code==='transport_disconnected'||error.code==='session_preflight_unavailable'&&!this.connected&&!this.closed)this.store.deferUnsubmitted(req.id);
+              else if(error.code==='session_unavailable')this.failure(req.id,req.threadId,'session_unavailable','연결된 Aside 세션을 찾을 수 없습니다. 새 대화에서 질문해 주세요. 이 질문은 Aside에 제출하지 않았습니다.');
+              else if(error.code==='session_preflight_unavailable')this.failure(req.id,req.threadId,'session_preflight_unavailable','Aside 연결 확인 중 통신이 끊겼습니다. 이 질문은 Aside에 제출하지 않았습니다. 연결 복구 후 직접 다시 질문해 주세요.');
+              else if(error.code==='session_creation_unavailable')this.failure(req.id,req.threadId,'session_creation_unavailable','Aside 대화를 초기화하지 못했습니다. 이 질문은 Aside에 제출하지 않았습니다. 새 질문으로 다시 시도해 주세요.');
+              else if(error.code==='session_model_update_failed')this.failure(req.id,req.threadId,'session_model_update_failed','Aside 세션의 프리셋 변경을 확인하지 못했습니다. 이 질문은 Aside에 제출하지 않았습니다. 연결과 세션 상태를 확인한 뒤 다시 질문해 주세요.');
               else this.failure(req.id,req.threadId,'confirmed_backend_failure');
             }
             else this.uncertain(req.id,active.phase==='creating'?'session_creation_unknown':'execution_unknown');
@@ -187,7 +212,7 @@ export class Engine {
       }
     } finally {
       this.pumping=false;
-      if(!this.closed && !this.store.hasUncertain() && this.store.nextQueued()) this.kick();
+      if(!this.closed && this.connected && !this.store.hasGlobalUncertainty() && this.store.nextQueued()) this.kick();
     }
   }
   async stop(threadId:string,userId:string,guildId:string|null):Promise<'stopped'|'requested'|'pending'|'uncertain'|'not_found'> {
@@ -226,7 +251,7 @@ export class Engine {
         return;
       }
       try {
-        const result=await this.backend.stop(backendId,s.selection);
+        const result=await this.backend.stop(backendId,s.bootstrapSelection??s.selection);
         if(result.confirmed || result.accepted) {
           this.store.finishStop(req.id,!result.confirmed);
           active?.controller.abort();
@@ -243,16 +268,16 @@ export class Engine {
     if(!uncertain) this.kick();
     return uncertain?'uncertain':this.store.request(req.id)?.errorCode==='stop_requested'?'requested':'stopped';
   }
-  status(threadId?:string):{queued:number;running:number;uncertain:number;deliveryUncertain:number;blocked:boolean} {
+  status(threadId?:string):{queued:number;running:number;uncertain:number;deliveryUncertain:number;deliveryFailed:number;blocked:boolean} {
     const counts=this.store.counts(threadId);
-    return {...counts,deliveryUncertain:this.store.deliveryUncertainCount(threadId),blocked:this.store.hasUncertain() || !!threadId && !!this.store.session(threadId)?.blocked};
+    return {...counts,deliveryUncertain:this.store.deliveryUncertainCount(threadId),deliveryFailed:this.store.deliveryFailedCount(threadId),blocked:this.store.hasGlobalUncertainty() || !!threadId && !!this.store.session(threadId)?.blocked};
   }
   flushOutbox():Promise<void> {return this.trackWork(this.deliverOutbox());}
   private async deliverOutbox():Promise<void> {
-    if(this.delivering || this.closed) return;
+    if(this.delivering || this.closed || !this.connected) return;
     this.delivering=true;
     try {
-      while(!this.closed) {
+      while(!this.closed && this.connected) {
         const row=this.store.outbox()[0];
         if(!row) break;
         if(row.kind==='progress_notice'&&this.outbound.progressNotices===false){
@@ -261,7 +286,7 @@ export class Engine {
           continue;
         }
         if(row.state==='sending' && (this.outbound.retrySafe===false || row.attemptedAt!==null && Date.now()-row.attemptedAt>=NONCE_RETRY_MS)) {
-          this.store.markDeliveryUncertain(row.id);
+          this.store.recordDeliveryFailure(row.id,new DeliveryFailure('unknown','restart','interrupted_send'));
           continue;
         }
         this.store.markSending(row.id);
@@ -269,11 +294,11 @@ export class Engine {
           const answerId=row.kind==='answer'&&row.isLast?row.requestId:undefined;
           const replyTo=row.kind==='queue_notice'?this.store.request(row.requestId)?.sourceId:undefined;
           const progressId=row.kind==='progress_notice'?row.requestId:undefined;
-          const messageId=await this.outbound.send(row.threadId,row.content,row.nonce,answerId,replyTo,progressId);
+          const messageId=await this.outbound.send(row.threadId,row.content,row.nonce,answerId,replyTo,progressId,messageId=>this.store.markSent(row.id,messageId));
           this.store.markSent(row.id,messageId);
-        } catch {
+        } catch(error) {
           // Informational progress delivery must not block the final answer.
-          if(row.kind==='progress_notice'||this.outbound.retrySafe===false){this.store.markDeliveryUncertain(row.id);continue;}
+          if(row.kind==='progress_notice'||this.outbound.retrySafe===false){this.store.recordDeliveryFailure(row.id,error instanceof DeliveryFailure?error:new DeliveryFailure('unknown','post','transport_unknown'));continue;}
           // Unknown transport result. Retry within enforced nonce window only.
           break;
         }

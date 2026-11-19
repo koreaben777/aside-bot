@@ -40,8 +40,11 @@ src/power.ts
 src/service-lock.ts
 src/slack/bot.ts
 src/slack/config.ts
+src/slack/connection.ts
 src/slack/main.ts
 src/slack/presentation.ts
+src/slack/split.ts
+src/slack/visual.ts
 src/store.ts
 src/types.ts
 tests/aside.test.ts
@@ -71,5 +74,15 @@ scripts/prepare-bots.ts
 src/runtime-control.ts
 tests/runtime-control.test.ts
 tests/menubar-lifecycle.test.ts
+tests/network-recovery.test.ts
+tests/slack-connection.test.ts
 tests/menubar-main.swift
 프로젝트 개요서.md
+tests/delivery.test.ts
+src/aside/transcript.ts
+tests/transcript-size.test.ts
+tests/profile-window.test.ts
+scripts/recover-creation.ts
+src/core/creation-recovery.ts
+tests/creation-recovery.test.ts
+tests/failure-isolation.test.ts

@@ -17,11 +17,12 @@ import {connect,type Socket} from 'node:net';
 import {setTimeout as delay} from 'node:timers/promises';
 import {pathToFileURL} from 'node:url';
 
-async function until(check:()=>Promise<boolean>){for(let i=0;i<200;i++){if(await check())return;await delay(10);}assert.fail('fixture timed out');}
+async function until(check:()=>Promise<boolean>){for(let i=0;i<1000;i++){if(await check())return;await delay(10);}assert.fail('fixture timed out');}
 function exchange(s:Socket,value:unknown):Promise<any>{return new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>{s.off('data',read);reject(Error('timeout'));},1000);const read=(b:Buffer)=>{text+=b.toString();if(text.includes('\n')){clearTimeout(timer);s.off('data',read);resolve(JSON.parse(text.split('\n')[0]!));}};s.on('data',read);s.write(JSON.stringify(value)+'\n');});}
 
 test('both real entrypoints stop safely in keychain, health, and SDK startup, and publish reconnects',async()=>{
- for(const platform of ['discord','slack'])for(const scenario of ['keychain','health','ready','events']){
+ for(const platform of ['discord','slack'])for(const scenario of ['keychain','health','ready','events','offline','closed-profile']){
+  if(platform==='discord'&&scenario==='offline')continue;
   const dir=await mkdtemp('/tmp/al-');const data=join(dir,'data');const cli=join(dir,'cli');
   await writeFile(join(dir,'scenario'),scenario);
   await writeFile(join(dir,'config.local.json'),JSON.stringify({ownerUserId:'111111111111111111',guildId:'222222222222222222',channelId:'333333333333333333',applicationId:'444444444444444444',cliPath:cli,asideAccount:'u0',asideModel:'openai-codex/gpt-6-luna',dataDir:data}));
@@ -31,6 +32,9 @@ import {readFileSync,writeFileSync} from 'node:fs';
 if(process.argv[2]==='--version'){
  if(readFileSync('scenario','utf8')==='health'){writeFileSync('health-wait','');setInterval(()=>{},1000);process.on('SIGTERM',()=>process.exit(1));}
  else console.log('1.26.916.1741');
+}else if(process.argv[2]==='repl'){
+ if(readFileSync('scenario','utf8')==='closed-profile'){writeFileSync('preset-failed','');console.error('No browser window is open for account u0');process.exitCode=1;}
+ else console.log('ASIDE_BOT_JSON:'+JSON.stringify({modelCategories:{fast:{provider:'openai-codex',modelId:'gpt-6-luna',thinkingLevel:'max'}}}));
 }else console.log('No sessions.');`,{mode:0o700});
   const keychain=`import {existsSync,readFileSync,writeFileSync} from 'node:fs';import {setTimeout as delay} from 'node:timers/promises';async function key(){writeFileSync('keychain-wait','');if(readFileSync('scenario','utf8')==='keychain')while(!existsSync('release'))await delay(10);return 'fake';}export const readBotToken=key,readSlackToken=key;`;
   const common=`import {EventEmitter} from 'node:events';import {readFileSync,writeFileSync,existsSync} from 'node:fs';const scenario=readFileSync('scenario','utf8');`;
@@ -45,8 +49,9 @@ export class Client extends EventEmitter{
 }`;
   const slack=common+`
 export const LogLevel={ERROR:1};export class SocketModeClient extends EventEmitter{
- start(){writeFileSync('sdk-wait','');return new Promise((resolve,reject)=>{this.finish=resolve;this.fail=reject;if(scenario!=='ready'){this.emit('connected');resolve({ok:true});}this.timer=setInterval(()=>{if(scenario==='ready'&&existsSync('release')){this.emit('connected');this.finish({ok:true});}if(existsSync('close-sdk'))this.emit('close');if(existsSync('recover-sdk'))this.emit('connected');},10);});}
- async disconnect(){clearInterval(this.timer);this.emit('disconnected');writeFileSync('sdk-destroyed','');setTimeout(()=>this.emit('connected'),10);}
+ constructor(options){super();this.autoReconnect=options.autoReconnectEnabled!==false;this.websocket={isActive:()=>this.connected};this.on('close',()=>{if(this.autoReconnect&&!this.stopped&&!this.reconnectScheduled){this.reconnectScheduled=true;setTimeout(()=>{void this.start().catch(()=>{});},10);}});}
+ start(){this.stopped=false;writeFileSync('sdk-wait','');if(existsSync('offline'))return Promise.reject(Error('network request failed'));clearInterval(this.timer);return new Promise((resolve,reject)=>{this.finish=resolve;this.fail=reject;if(scenario!=='ready'){this.connected=true;this.emit('connected');resolve({ok:true});}this.timer=setInterval(()=>{if(scenario==='ready'&&existsSync('release')){this.connected=true;this.emit('connected');this.finish({ok:true});}if(existsSync('close-sdk')&&(scenario!=='offline'||!this.closeObserved)){this.closeObserved=true;this.connected=false;this.emit('close');}if(existsSync('recover-sdk')){this.connected=true;this.emit('connected');}},10);});}
+ async disconnect(){this.stopped=true;clearInterval(this.timer);this.connected=false;this.emit('disconnected');this.fail?.(Error('disconnected'));writeFileSync('sdk-destroyed','');}
 }`;
   const botModule=platform==='discord'?`export function attachDiscordBot(){}export function createDiscordOutbound(){return {send:async()=> 'msg'}}export function resolveDiscordAttachments(){return async()=>{throw Error()}}`:`export function createSlackApi(){return {}}export async function connectSlack(){return {dmChannelId:'D12345678',botUserId:'U87654321'}}export function createSlackOutbound(){return {send:async()=> 'msg'}}export function allowedSlackParent(){return true}export class SlackBot{async handle(){}}`;
   const preload=`import {registerHooks} from 'node:module';
@@ -68,20 +73,38 @@ registerHooks({resolve(specifier,context,next){
    await until(()=>stat(socketPath).then(()=>true,()=>false));owner=connect(socketPath);owner.on('error',()=>{});
    let snapshot=(await exchange(owner,{v:1,id:'s',op:'status'})).status;
    assert.equal((await exchange(owner,{v:1,id:'c',op:'claim',instanceId:snapshot.instanceId,token})).ok,true);
+   if(scenario==='closed-profile'){
+    await until(()=>stat(join(dir,'preset-failed')).then(()=>true,()=>false));
+    assert.equal(await Promise.race([closed,delay(4000).then(()=>{throw Error('profile check did not stop startup');})]),1);
+    assert.equal(await stat(join(dir,'sdk-wait')).then(()=>true,()=>false),false);
+    assert.equal(await stat(socketPath).then(()=>true,()=>false),false);
+    continue;
+   }
    const marker=scenario==='keychain'?'keychain-wait':scenario==='health'?'health-wait':'sdk-wait';
    await until(()=>stat(join(dir,marker)).then(()=>true,()=>false));
-   if(scenario==='events'){
+   if(scenario==='events'||scenario==='offline'){
     await until(async()=>{snapshot=(await exchange(owner!,{v:1,id:'s',op:'status'})).status;return snapshot.phase==='connected';});
     assert.equal(snapshot.preflightPassed,true);assert.equal(snapshot.engineStarted,true);
+    if(scenario==='offline')await writeFile(join(dir,'offline'),'');
     await writeFile(join(dir,'close-sdk'),'');await until(async()=>{snapshot=(await exchange(owner!,{v:1,id:'s',op:'status'})).status;return snapshot.phase==='reconnecting';});
-    await rm(join(dir,'close-sdk'));await writeFile(join(dir,'recover-sdk'),'');await until(async()=>{snapshot=(await exchange(owner!,{v:1,id:'s',op:'status'})).status;return snapshot.phase==='connected';});
+    await rm(join(dir,'close-sdk'));
+    if(scenario==='offline'){
+     await delay(100);await rm(join(dir,'offline'));
+     // No SDK connected event is injected: the entrypoint must restart Socket Mode itself.
+    }else await writeFile(join(dir,'recover-sdk'),'');
+    await until(async()=>{snapshot=(await exchange(owner!,{v:1,id:'s',op:'status'})).status;return snapshot.phase==='connected';});
     owner.destroy();
-   }else{child.kill('SIGTERM');await writeFile(join(dir,'release'),'');}
+   }else{
+    child.kill('SIGTERM');
+    if(scenario==='keychain'||platform==='discord'&&scenario==='ready')await until(async()=>((await exchange(owner!,{v:1,id:'s',op:'status'})).status.phase==='stopping'));
+    await writeFile(join(dir,'release'),'');
+   }
    const code=await Promise.race([closed,delay(4000).then(()=>{throw Error('entrypoint failed to stop: '+diagnostic);})]);assert.equal(code,0,diagnostic);
-   if(scenario==='ready'||scenario==='events')assert.equal(await stat(join(dir,'sdk-destroyed')).then(()=>true,()=>false),true);
+   if(scenario==='ready'||scenario==='events'||scenario==='offline')assert.equal(await stat(join(dir,'sdk-destroyed')).then(()=>true,()=>false),true);
    assert.equal(await stat(socketPath).then(()=>true,()=>false),false);
    const lockPath=join(data,platform==='slack'?'slack/service.lock':'service.lock');assert.equal(await stat(lockPath).then(()=>true,()=>false),false);
-   if(scenario!=='events')assert.equal(await readFile(join(data,platform==='slack'?'slack/startup-status.json':'startup-status.json'),'utf8').then(()=>true,()=>false),false);
-  }finally{owner?.destroy();await writeFile(join(dir,'release'),'');if(child.exitCode===null)child.kill('SIGTERM');await closed;await rm(dir,{recursive:true,force:true});}
+   if(scenario!=='events'&&scenario!=='offline')assert.equal(await readFile(join(data,platform==='slack'?'slack/startup-status.json':'startup-status.json'),'utf8').then(()=>true,()=>false),false);
+  }catch(error){throw new Error(platform+'/'+scenario+': '+diagnostic,{cause:error});}
+  finally{owner?.destroy();await writeFile(join(dir,'release'),'');if(child.exitCode===null)child.kill('SIGTERM');await closed;await rm(dir,{recursive:true,force:true});}
  }
 });

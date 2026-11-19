@@ -10,7 +10,7 @@ import { Engine } from '../src/core/engine.js';
 import { splitOutput } from '../src/core/split.js';
 import { Store } from '../src/store.js';
 import {AsideSettings} from '../src/aside/settings.js';
-import { BackendFailureError, type Backend, type BotConfig, type Outbound } from '../src/types.js';
+import { BackendFailureError, CompletedOutputError, type Backend, type BotConfig, type Outbound } from '../src/types.js';
 
 const config:BotConfig={ownerUserId:'owner',guildId:'guild',channelId:'parent'};
 function setup(backend?:Backend,outbound?:Outbound) {
@@ -198,6 +198,18 @@ test('generic run error blocks all new execution; confirmed failure does not',as
     await until(()=>safe.store.requestBySource('safe')?.state==='failed');
     assert.equal(safe.store.hasUncertain(),false);
   } finally {safe.cleanup();}
+});
+
+test('confirmed missing initialization tells the owner the question was never submitted and releases the queue',async()=>{
+ let creates=0,runs=0;
+ const t=setup({health:async()=>{},createSession:async()=>{if(++creates===1)throw new BackendFailureError('session_creation_unavailable');return 'sid';},runTurn:async()=>{runs++;return {text:'Answer'};},stop:async()=>({confirmed:true})});
+ try{
+  t.engine.submit(t.turn('vanished-create'));
+  await until(()=>t.store.requestBySource('vanished-create')?.state==='failed'&&t.sent.length===1);
+  assert.equal(t.store.requestBySource('vanished-create')?.errorCode,'session_creation_unavailable');assert.equal(runs,0);assert.equal(creates,1);
+  assert.match(t.sent[0]?.content??'',/질문은.*제출하지 않았습니다/);assert.equal(t.store.hasUncertain(),false);
+  t.engine.submit(t.turn('explicit-fresh'));await until(()=>t.store.requestBySource('explicit-fresh')?.state==='completed');assert.equal(runs,1);assert.equal(creates,2);
+ }finally{t.cleanup();}
 });
 
 test('createSession timeout defaults to uncertain, never launches turn',async()=>{
@@ -529,4 +541,56 @@ test('late session creation during shutdown preserves an unconfirmed remote stop
   const stopping=t.engine.stop('thread','owner','guild');release('late-session');assert.equal(await stopping,'uncertain');
   t.engine.abortLocalWork();await t.engine.waitForIdle();assert.equal(turns,0);assert.equal(t.store.requestBySource('late-create')?.state,'uncertain');assert.equal(t.sent.length,0);
  }finally{release('late-session');t.cleanup();}
+});
+
+test('Discord new and ask admission remains available after unrelated bootstrap uncertainty',async()=>{
+ let created=0;const t=setup({health:async()=>{},createSession:async()=>`handler-${++created}`,runTurn:async()=>({text:'Answer'}),stop:async()=>({confirmed:true})}),client=new EventEmitter();let count=0;const replies:string[]=[];
+ const destination={type:0,guildId:'guild',threads:{create:async()=>({id:`new-${++count}`,delete:async()=>{}})}};
+ const api=Object.assign(client,{channels:{fetch:async()=>destination}});
+ attachDiscordBot(api as unknown as Client,t.engine);
+ try {
+ const prior=t.store.enqueue('prior-create','thread','synthetic');if(prior.kind!=='queued')throw Error();t.store.startRequest(prior.requestId);t.store.transition(prior.requestId,'running','uncertain','session_creation_unknown');
+ for(const sub of ['new','ask']) {
+ client.emit('interactionCreate',{
+ id:`origin-${sub}`,isChatInputCommand:()=>true,commandName:'aside',user:{id:'owner'},guildId:'guild',channelId:'parent',
+ channel:{id:'parent',guildId:'guild',type:0,isThread:()=>false},client:api,
+ options:{getSubcommand:()=>sub,getString:(name:string)=>name==='question'?'Hello':null},deferReply:async()=>{},
+ editReply:async(o:{content:string})=>{replies.push(o.content);},reply:async(o:{content:string})=>{replies.push(o.content);},
+ });
+ await until(()=>t.store.requestBySource(`origin-${sub}`)?.state==='completed');
+ assert.ok(t.store.sessionByOrigin(`origin-${sub}`));
+ }
+ assert.equal(count,2);assert.equal(replies.length,2);
+ } finally {t.cleanup();}
+});
+
+
+
+test('formatting failure after a resolved turn fails only that request and never reruns it',async()=>{
+ let runs=0;
+ const t=setup({health:async()=>{},createSession:async()=> 'sid',runTurn:async()=>{runs++;return {text:'Answer'}},stop:async()=>({confirmed:true})});
+ Reflect.set(t.engine.outbound,'formatAnswer',()=>{if(runs===1)throw Error('private formatting diagnostic');return ['second answer'];});
+ try{
+  t.engine.submit(t.turn('format-failed'));
+  await until(()=>['failed','uncertain'].includes(t.store.requestBySource('format-failed')?.state??''));
+  assert.equal(t.store.requestBySource('format-failed')?.state,'failed');
+  assert.equal(t.store.requestBySource('format-failed')?.errorCode,'completed_output_output_format_failed');
+  assert.equal(t.store.hasGlobalUncertainty(),false);assert.equal(Boolean(t.store.session('thread')?.blocked),false);
+  assert.equal(t.engine.submit(t.turn('format-next')).kind,'queued');
+  await until(()=>t.store.requestBySource('format-next')?.state==='completed');
+  assert.equal(runs,2);assert.ok(t.sent.every(m=>!m.content.includes('private formatting diagnostic')));
+ }finally{await t.engine.waitForIdle();t.cleanup();}
+});
+
+
+test('verified completion source failure preserves its code without blocking the next request',async()=>{
+ let calls=0;
+ const t=setup({health:async()=>{},createSession:async()=> 'sid',runTurn:async()=>{if(++calls===1)throw new CompletedOutputError('invalid_sources');return {text:'next'};},stop:async()=>({confirmed:true})});
+ try{
+  t.engine.submit(t.turn('source-failed'));
+  await until(()=>t.store.requestBySource('source-failed')?.state==='failed');
+  assert.equal(t.store.requestBySource('source-failed')?.errorCode,'completed_output_invalid_sources');
+  assert.equal(t.store.hasGlobalUncertainty(),false);assert.equal(t.engine.submit(t.turn('source-next')).kind,'queued');
+  await until(()=>t.store.requestBySource('source-next')?.state==='completed');assert.equal(calls,2);
+ }finally{await t.engine.waitForIdle();t.cleanup();}
 });

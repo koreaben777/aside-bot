@@ -31,6 +31,40 @@ test('new thread and pending request keep the original selection across reopenin
 });
 
 const config={ownerUserId:'owner',guildId:'guild',channelId:'parent'};
+test('thread preset persists across reopen while preserving bootstrap and request snapshots',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'aside-preset-switch-')),file=join(dir,'state.sqlite');
+ const deep:ModelSelection={provider:'openai-codex',modelId:'gpt-6-sol',thinkingLevel:'xhigh'};
+ let store=new Store(file);
+ try{
+  store.bindThread({threadId:'thread',guildId:'guild',parentChannelId:'parent',ownerUserId:'owner'},'origin');
+  store.setBackendId('thread','session-id');
+  store.enqueue('old','thread','question');store.startRequest(store.requestBySource('old')!.id);
+  store.transition(store.requestBySource('old')!.id,'running','completed');
+  // Simulate the trigger installed by the previous version before reopening.
+  store.db.exec("DROP TRIGGER immutable_selection; CREATE TRIGGER immutable_selection BEFORE UPDATE OF model_selection ON sessions BEGIN SELECT RAISE(ABORT,'immutable model selection'); END;");
+  store.close();store=new Store(file);
+  assert.equal(store.setThreadPreset('thread','deep',deep),true);
+  store.close();store=new Store(file);
+  assert.equal(store.session('thread')?.backendId,'session-id');
+  assert.deepEqual(store.session('thread')?.bootstrapSelection,LEGACY_SELECTION);
+  assert.deepEqual(store.session('thread')?.selection,deep);
+  assert.deepEqual(store.requestBySource('old')?.selection,LEGACY_SELECTION);
+  store.enqueue('next','thread','followup');
+  assert.deepEqual(store.requestBySource('next')?.selection,deep);
+  assert.equal(store.setThreadPreset('thread','fast',LEGACY_SELECTION),false);
+  assert.throws(()=>store.db.prepare('UPDATE sessions SET model_selection=?').run(JSON.stringify(LEGACY_SELECTION)));
+  store.cancelQueued('thread');
+  assert.equal(store.setThreadPreset('thread','fast',LEGACY_SELECTION),true);
+  assert.deepEqual(store.session('thread')?.bootstrapSelection,LEGACY_SELECTION);
+  assert.throws(()=>store.db.prepare('UPDATE sessions SET bootstrap_model_selection=?').run(JSON.stringify(deep)));
+  store.bindThread({threadId:'uncreated',guildId:'guild',parentChannelId:'parent',ownerUserId:'owner'},'uncreated-origin');
+  assert.equal(store.setThreadPreset('uncreated','deep',deep),true);
+  assert.deepEqual(store.session('uncreated')?.bootstrapSelection,deep);
+  assert.equal(store.setThreadPreset('uncreated','fast',LEGACY_SELECTION),true);
+  assert.deepEqual(store.session('uncreated')?.bootstrapSelection,LEGACY_SELECTION);
+ }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 async function until(check:()=>boolean){for(let i=0;i<200;i++){if(check())return;await new Promise(resolve=>setTimeout(resolve,2));}assert.fail('timed out');}
 function uiFixture(answer='Answer'){
  const dir=mkdtempSync(join(tmpdir(),'aside-button-')),store=new Store(join(dir,'state.sqlite'));
@@ -208,7 +242,7 @@ test('unexpected answer models become uncertain without an answer or buttons',as
   t.engine.backend.runTurn=async()=>({text:'Wrong model answer',model:'openai-codex/gpt-6-sol'});
   t.engine.submit({sourceId:'mismatch',userId:'owner',guildId:'guild',channelId:'original',content:'Question'});
   await until(()=>t.store.requestBySource('mismatch')?.state==='uncertain');
-  assert.equal(t.store.session('original')?.blocked,1);assert.equal(t.store.latestAnswer('original'),undefined);assert.equal(t.sent.length,0);
+  assert.equal(t.store.session('original')?.blocked,1);assert.equal(t.store.latestAnswer('original'),undefined);assert.equal(t.sent.length,1);assert.match(String(t.sent[0]?.content),/원격 실행 결과/);
  }finally{t.cleanup();}
 });
 

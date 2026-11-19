@@ -12,6 +12,17 @@ export class BackendFailureError extends Error {
   }
 }
 
+/** A verified completed turn could not be published. Never retry execution. */
+export class CompletedOutputError extends Error {
+  readonly code:'invalid_sources'|'output_format_failed';
+  readonly safeToRetry=false;
+  constructor(code:'invalid_sources'|'output_format_failed'='output_format_failed') {
+    super('Verified completed execution could not be formatted');
+    this.name='CompletedOutputError';
+    this.code=code==='invalid_sources'?'invalid_sources':'output_format_failed';
+  }
+}
+
 /** Unknown remote execution state. Generic run/create errors are treated identically. */
 export class ExecutionUncertainError extends Error {
   readonly code: string;
@@ -26,7 +37,7 @@ export class ExecutionUncertainError extends Error {
 export const PRESET_NAMES = ['fast','standard','deep'] as const;
 export type PresetName = typeof PRESET_NAMES[number];
 export const PRESET_LABELS:Record<PresetName,string> = {fast:'빠른 답변',standard:'일반',deep:'깊은 분석'};
-export const MODEL_IDS = ['gpt-6-luna','gpt-5.6-sol','gpt-6-sol'] as const;
+export const MODEL_IDS = ['gpt-6-luna','gpt-5.6-sol','gpt-6-sol','gpt-6.1-sol','gpt-6-astra'] as const;
 export const EFFORTS = ['off','minimal','low','medium','high','xhigh','max'] as const;
 export interface ModelSelection {
   provider:'openai-codex';
@@ -58,8 +69,9 @@ export interface Backend {
   health(): Promise<void>;
   /** Must return a stable identifier; throw BackendFailureError only if no remote state survives. */
   createSession(selection?:ModelSelection): Promise<string>;
-  /** Return final text only. Unknown/timeouts must throw ExecutionUncertainError or a generic error. */
-  runTurn(sessionId: string, prompt: string, signal: AbortSignal, selection?:ModelSelection, options?:{generateThreadTitle:boolean}): Promise<BackendAnswer>;
+  /** Return final text only. Unknown/timeouts must throw ExecutionUncertainError or a generic error.
+   * Check canSubmit after preflight; transport_disconnected guarantees no user submission. */
+  runTurn(sessionId: string, prompt: string, signal: AbortSignal, selection?:ModelSelection, options?:{generateThreadTitle?:boolean;bootstrapSelection?:ModelSelection}, canSubmit?:()=>boolean): Promise<BackendAnswer>;
   /** confirmed means termination evidence; accepted means Aside acknowledged interruption only. */
   stop(sessionId: string, selection?:ModelSelection): Promise<{ confirmed: boolean; accepted?: boolean }>;
 }
@@ -95,13 +107,20 @@ export interface ThreadBinding {
   ownerUserId: string;
 }
 
+/** Only fixed, non-sensitive categories may be persisted; never raw SDK errors. */
+export class DeliveryFailure extends Error {
+  constructor(readonly outcome:'not_sent'|'unknown',readonly stage:'prepare'|'post'|'receipt'|'restart',readonly code:string,readonly httpStatus:number|null=null) {
+    super(code);this.name='DeliveryFailure';
+  }
+}
+
 export interface Outbound {
   /** False when the transport cannot deduplicate retries after an ambiguous send. */
   retrySafe?: boolean;
   /** Default transports retain the shared ten-second progress notices. */
   progressNotices?:boolean;
   formatAnswer?(answer:BackendAnswer,elapsed:string):string[];
-  send(threadId: string, content: string, nonce: string, answerRequestId?:number, replyToMessageId?:string, progressRequestId?:number): Promise<string>; // Discord message ID
+  send(threadId: string, content: string, nonce: string, answerRequestId?:number, replyToMessageId?:string, progressRequestId?:number, accepted?:(messageId:string)=>void): Promise<string>; // Discord message ID
   setThreadTitle?(threadId:string,title:string,expectedTitle?:string):Promise<void>;
 }
 

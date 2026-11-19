@@ -23,7 +23,7 @@ let startup=Promise.resolve();
 const readyWork=new Set<Promise<void>>();
 const checkpoint=()=>{if(stopping)throw Error('shutdown_pending');};
 const publish=(patch:Partial<Snapshot>={})=>control?.publish({phase,stage,sleepActive:sleep.active(),...patch});
-const connection=(event:Parameters<typeof reduceConnection>[1])=>{phase=reduceConnection(phase,event,prepared);publish();};
+const connection=(event:Parameters<typeof reduceConnection>[1])=>{phase=reduceConnection(phase,event,prepared);engine?.setConnected(phase==='connected');publish();};
 function shutdown(code=0):Promise<void>{
  if(shutdownTask)return shutdownTask;
  stopping=true;phase='stopping';stage='shutdown';publish();engine?.close();if(timer)clearInterval(timer);
@@ -51,12 +51,14 @@ async function initialize(){
  if(!bootstrap.token&&!await sleep.set(bootstrap.sleepEnabled)&&bootstrap.sleepEnabled)throw Error('sleep_unavailable');checkpoint();
  store=new Store(join(config.dataDir,'state.sqlite'));
  const backend=new AsideBackend({cliPath:config.cliPath,registryPath:join(config.dataDir,'aside-registry.json'),registryKeyPath:join(config.dataDir,'aside-registry.key')});
- stage='aside';publish();try{await backend.health();}catch{publish({asideHealth:{state:'error',checkedAt:new Date().toISOString()}});throw Error('aside_unavailable');}checkpoint();
+ const settings=new AsideSettings(config.cliPath);
+ stage='aside';publish();try{await backend.health();await settings.readPreset(store.defaultPreset());}catch{publish({asideHealth:{state:'error',checkedAt:new Date().toISOString()}});throw Error('aside_unavailable');}checkpoint();
  publish({asideHealth:{state:'ok',checkedAt:new Date().toISOString()}});
  client=new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMessages,GatewayIntentBits.MessageContent],allowedMentions:{parse:[]}});
  const activeClient=client,activeStore=store;
  const attachments=new AttachmentFiles(join(config.dataDir,'attachments'),resolveDiscordAttachments(client,config));
- engine=new Engine(config,store,backend,createDiscordOutbound(client,config,store,()=>stopping),attachments,new AsideSettings(config.cliPath));const activeEngine=engine;
+ engine=new Engine(config,store,backend,createDiscordOutbound(client,config,store,()=>stopping),attachments,settings);const activeEngine=engine;
+ engine.setConnected(false);
  client.on(Events.ShardReconnecting,()=>connection('reconnecting'));
  client.on(Events.ShardDisconnect,event=>{connection([4004,4010,4011,4012,4013,4014].includes(event.code)?'fatal':'closed');});
  client.on(Events.ShardReady,()=>{if(activeClient.isReady())connection('ready');});

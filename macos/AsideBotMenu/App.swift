@@ -16,7 +16,7 @@ private let descriptions:[String:String]=[
   configureController();render()
   poll=makeMenuRefreshTimer { [weak self] in Task{@MainActor in await self?.controller?.refresh()}}
   NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(wake),name:NSWorkspace.didWakeNotification,object:nil)
-  if settings.autoStartBots,controller != nil{Task{await action{try await self.controller?.startBoth()}}}
+  if settings.autoStartBots,controller != nil{Task{await action{try await self.controller?.startBots()}}}
  }
  private func configureController(){
   guard !settings.projectPath.isEmpty else{return}
@@ -30,32 +30,33 @@ private let descriptions:[String:String]=[
  private func render(){
   guard item != nil else{return};let bots=controller?.bots ?? [.discord:BotViewState(),.slack:BotViewState()];let state=aggregate(bots)
   let icon:String,label:String
-  switch state {case .normal:icon="checkmark.circle.fill";label="두 봇 연결됨";case .progress:icon="arrow.triangle.2.circlepath";label="봇 상태 전환 중";case .stopped:icon="stop.circle";label="두 봇 중지됨";case .warning:icon="exclamationmark.triangle";label="봇 상태 확인 필요"}
+  switch state {case .normal:icon="checkmark.circle.fill";label="Slack 연결됨";case .progress:icon="arrow.triangle.2.circlepath";label="Slack 상태 전환 중";case .stopped:icon="stop.circle";label="Slack 중지됨";case .warning:icon="exclamationmark.triangle";label="Slack 상태 확인 필요"}
   let image=NSImage(systemSymbolName:icon,accessibilityDescription:label);image?.isTemplate=true;item.button?.image=image;item.button?.setAccessibilityLabel(label);item.button?.toolTip=label
   let menu=NSMenu();menu.autoenablesItems=false
-  for p in Platform.allCases {let s=bots[p]!;add(menu,"\(p == .discord ? "Discord":"Slack"): \(descriptions[s.phase] ?? "확인 불가")",enabled:false)}
-  let external=bots.values.contains{$0.ownership=="external"}
+  add(menu,"Discord: 비활성화",enabled:false)
+  add(menu,"Slack: \(descriptions[bots[.slack]!.phase] ?? "확인 불가")",enabled:false)
+  let external=bots[.slack]?.ownership=="external"
   add(menu,controller?.conflict==true ? "관리: LaunchAgent 확인 필요":external ? "관리: 외부 실행 관찰 중":"관리: 메뉴 바 앱",enabled:false);menu.addItem(.separator())
-  add(menu,"두 봇 시작",#selector(start),enabled:controller != nil && !quitting)
-  add(menu,"관리 봇 정상 중지",#selector(stop),enabled:controller != nil)
-  add(menu,"외부 실행 인계…",#selector(takeOver),enabled:external && controller?.conflict != true && !quitting);menu.addItem(.separator())
+  add(menu,"Slack 시작",#selector(start),enabled:controller != nil && bots[.slack]?.phase=="stopped" && !quitting)
+  add(menu,"Slack 정상 중지",#selector(stop),enabled:controller != nil)
+  add(menu,"Slack 외부 실행 인계…",#selector(takeOver),enabled:external && controller?.conflict != true && !quitting);menu.addItem(.separator())
   add(menu,"자동 유휴 잠자기 방지",#selector(toggleSleep),checked:settings.preventIdleSleep)
-  for p in Platform.allCases {let s=bots[p]!.snapshot;add(menu,"\(p.rawValue): 실제 절전방지 \(s.map{$0.sleepActive ? "켜짐":"꺼짐"} ?? "미확인")",enabled:false)}
+  let sleep=bots[.slack]!.snapshot;add(menu,"Slack: 실제 절전방지 \(sleep.map{$0.sleepActive ? "켜짐":"꺼짐"} ?? "미확인")",enabled:false)
   menu.addItem(.separator());add(menu,"로그인 시 앱 실행",#selector(toggleLogin),checked:SMAppService.mainApp.status == .enabled)
   let login:String;switch SMAppService.mainApp.status{case .enabled:login="로그인 항목: 등록됨";case .requiresApproval:login="로그인 항목: 시스템 설정 승인 대기";case .notFound:login="로그인 항목: 앱 배치 확인 필요";case .notRegistered:login=settings.launchAtLoginRequested ? "로그인 항목: 미등록 (희망 켜짐)":"로그인 항목: 미등록";@unknown default:login="로그인 항목: 확인 불가"}
-  add(menu,login,enabled:false);add(menu,"앱 실행 시 봇 자동 시작",#selector(toggleAuto),checked:settings.autoStartBots)
+  add(menu,login,enabled:false);add(menu,"앱 실행 시 Slack 자동 시작",#selector(toggleAuto),checked:settings.autoStartBots)
   add(menu,"프로젝트 폴더 선택…",#selector(chooseProject),enabled:bots.values.allSatisfy{$0.ownership != "managed"} && !quitting)
   let override=NSMenu();for (name,value) in [("설정 파일 사용",nil),("스레드 자동 응답 켜짐","true"),("스레드 자동 응답 꺼짐","false")] as [(String,String?)] {let m=add(override,name,#selector(setOverride),checked:settings.slackOverride==value);m.representedObject=value ?? "unset";m.isEnabled=bots.values.allSatisfy{$0.ownership != "managed"}}
   let overrides=add(menu,"Slack 스레드 자동 응답 (다음 시작)");overrides.submenu=override
   menu.addItem(.separator());add(menu,"상태·오류 상세…",#selector(details));add(menu,"Discord 안전 로그…",#selector(discordLog));add(menu,"Slack 안전 로그…",#selector(slackLog));menu.addItem(.separator())
-  add(menu,"관리 봇 종료 후 앱 종료",#selector(quit));item.menu=menu
+  add(menu,"Slack 종료 후 앱 종료",#selector(quit));item.menu=menu
  }
  private func alert(_ text:String){let a=NSAlert();a.messageText=text;a.addButton(withTitle:"확인");a.runModal()}
  private func action(_ work:() async throws -> Void) async {do{try await work()}catch{alert(descriptions[(error as? ManagerError)?.code ?? "start_failed"] ?? "상태를 확인하세요.")};render()}
- @objc private func start(){if controller==nil{chooseProject();return};Task{await action{try await self.controller?.startBoth()}}}
- @objc private func stop(){Task{await action{try await self.controller?.stopBoth()}}}
+ @objc private func start(){if controller==nil{chooseProject();return};Task{await action{try await self.controller?.startBots()}}}
+ @objc private func stop(){Task{await action{try await self.controller?.stopBots()}}}
  @objc private func takeOver(){
-  let a=NSAlert();a.messageText="외부 실행을 정상 종료하고 앱 아래에서 다시 시작합니다.";a.informativeText="연결이 끊기고 실행 중인 요청에 중단을 요청할 수 있습니다. Slack 환경변수는 자동 추출하지 않습니다. 현재 설정 파일과 메뉴의 Slack 스레드 자동 응답 설정이 의도한 값인지 확인하세요. LaunchAgent와 불명확한 프로세스는 인계하지 않습니다.";a.addButton(withTitle:"인계");a.addButton(withTitle:"취소")
+  let a=NSAlert();a.messageText="외부 Slack 실행을 정상 종료하고 앱 아래에서 다시 시작합니다.";a.informativeText="연결이 끊기고 실행 중인 요청에 중단을 요청할 수 있습니다. Slack 환경변수는 자동 추출하지 않습니다. 현재 설정 파일과 메뉴의 Slack 스레드 자동 응답 설정이 의도한 값인지 확인하세요. LaunchAgent와 불명확한 프로세스는 인계하지 않습니다.";a.addButton(withTitle:"인계");a.addButton(withTitle:"취소")
   if a.runModal() == .alertFirstButtonReturn{Task{await action{try await self.controller?.takeOver()}}}
  }
  @objc private func toggleSleep(){settings.preventIdleSleep.toggle();Task{await controller?.setSleep(settings.preventIdleSleep);render()}}
@@ -90,7 +91,7 @@ private let descriptions:[String:String]=[
  func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
   if quitState.waiting{quitState.pendingReply=true;quitState.wantsExit=true;return .terminateLater}
   if quitState.begin(){return .terminateNow};render()
-  let work=Task{try await controller?.stopBoth()}
+  let work=Task{try await controller?.stopBots()}
   Task{
    do{try await work.value;switch quitState.finish(){case .reply:sender.reply(toApplicationShouldTerminate:true);case .terminate:sender.terminate(nil);case .stay:render()}}
    catch{if quitState.fail(){sender.reply(toApplicationShouldTerminate:false)};alert("종료를 확인하지 못했습니다. 앱을 유지합니다.");render()}

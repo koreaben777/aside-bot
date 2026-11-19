@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "doctor": "npm run build && node dist/scripts/doctor.js",
+    "recover:creation": "npm run build && node dist/scripts/recover-creation.js",
     "setup:discord": "npm run build && node dist/scripts/setup-discord.js",
     "setup:slack": "npm run build && node dist/scripts/setup-slack.js",
     "start:slack": "npm run build && node dist/src/slack/main.js",

@@ -319,6 +319,64 @@ test('Slack commands select presets without changing existing threads and stop o
  }finally{t.store.close();}
 });
 
+test('Slack thread preset changes only future turns and preserves the Aside session',async()=>{
+ const t=setup(false),runs:Array<{id:string;selection:unknown;options:unknown}>=[];let creates=0;
+ t.engine.backend.createSession=async()=>{creates++;return 'session-id';};
+ t.engine.backend.runTurn=async(id,_prompt,_signal,selection,options)=>{runs.push({id,selection,options});return {text:'answer'};};
+ const threadId='D12345678:1700000000.000001';
+ try{
+  await t.bot.handle(message());await t.engine.waitForIdle();
+  const original=t.store.session(threadId)!.selection;
+  await t.bot.handle(message('1700000000.000002',{thread_ts:'1700000000.000001',text:'!aside preset deep'}));
+  assert.equal(t.store.session(threadId)?.selection.modelId,'gpt-6-sol');
+  assert.equal(t.store.defaultPreset(),'fast');
+  await t.bot.handle(message('1700000000.000003',{thread_ts:'1700000000.000001',text:'continue'}));await t.engine.waitForIdle();
+  assert.equal(creates,1);assert.deepEqual(runs.map(r=>r.id),['session-id','session-id']);
+  assert.deepEqual(runs[1]?.selection,{provider:'openai-codex',modelId:'gpt-6-sol',thinkingLevel:'xhigh'});
+  assert.deepEqual(runs[1]?.options,{bootstrapSelection:original});
+  assert.deepEqual(t.store.requestBySource('T12345678:D12345678:1700000000.000001')?.selection,original);
+  await t.bot.handle(message('1700000000.000004',{thread_ts:'1700000000.000001',text:'!aside settings'}));
+  assert.match(String(t.sent.at(-1)?.body.text),/이 대화:.*gpt-6-sol.*xhigh/);
+  let stopSelection:unknown;
+  t.engine.backend.stop=async(_id,selection)=>{stopSelection=selection;return {confirmed:true};};
+  t.store.enqueue('stop-target',threadId,'running');t.store.startRequest(t.store.requestBySource('stop-target')!.id);
+  await t.bot.handle(message('1700000000.000005',{thread_ts:'1700000000.000001',text:'!aside stop'}));
+  assert.deepEqual(stopSelection,original);
+  assert.equal(t.store.requestBySource('stop-target')?.state,'cancelled');
+ }finally{t.engine.close();await t.engine.waitForIdle();t.store.close();}
+});
+
+test('Slack refuses busy, uncertain, unbound and unauthorized thread preset changes',async()=>{
+ for(const state of ['queued','running','cancel_requested','uncertain','unbound','unauthorized'] as const){
+  const t=setup(),threadId='D12345678:1700000000.000001';
+  try{
+   if(state!=='unbound')await t.bot.handle(message());
+   if(['running','cancel_requested','uncertain'].includes(state))t.store.db.prepare('UPDATE requests SET state=?').run(state);
+   await t.bot.handle(message('1700000000.000002',{thread_ts:'1700000000.000001',text:'!aside preset deep',...(state==='unauthorized'?{user:'UOTHER123'}:{})}));
+   assert.equal(t.store.defaultPreset(),'fast');
+   assert.equal(t.store.session(threadId)?.selection.modelId,state==='unbound'?undefined:'gpt-6-luna');
+  }finally{t.store.close();}
+ }
+});
+
+test('Slack preset reads cannot change settings after failure or a concurrent question',async()=>{
+ for(const mode of ['failure','question'] as const){
+  const t=setup(),threadId='D12345678:1700000000.000001';
+  try{
+   await t.bot.handle(message());t.store.cancelQueued(threadId);
+   const read=t.engine.settings!.readPreset.bind(t.engine.settings);
+   t.engine.settings!.readPreset=async name=>{
+    if(mode==='failure')throw Error('synthetic failure');
+    t.store.enqueue('concurrent',threadId,'new question');return read(name);
+   };
+   await t.bot.handle(message('1700000000.000002',{thread_ts:'1700000000.000001',text:'!aside preset deep'}));
+   assert.equal(t.store.session(threadId)?.selection.modelId,'gpt-6-luna');
+   assert.equal(t.store.defaultPreset(),'fast');
+   assert.match(String(t.sent.at(-1)?.body.text),mode==='failure'?/설정을 변경하지 않았습니다/:/변경할 수 없습니다/);
+  }finally{t.store.close();}
+ }
+});
+
 test('Slack outbound validates bindings and sends plain text only to the owner DM thread',async()=>{
  const t=setup();try{
   await t.bot.handle(message());
@@ -427,7 +485,7 @@ test('Slack API checks failure envelopes and never replays POSTs after a lost re
  const api=slack.createSlackApi('synthetic-token',async()=>{calls++;throw new Error('lost response');});
  await assert.rejects(api('chat.postMessage',{channel:'D12345678',text:'answer'}));assert.equal(calls,1);
  const bad=slack.createSlackApi('synthetic-token',async()=>new Response('{"ok":false,"error":"invalid_auth"}'));
- await assert.rejects(bad('auth.test'),/slack_api_failed/);
+ await assert.rejects(bad('auth.test'),/invalid_auth/);
  const requests:Array<{url:string;method?:string;body?:unknown}>=[];
  const read=slack.createSlackApi('synthetic-token',async(url,options)=>{requests.push({url:String(url),method:options?.method,body:options?.body});return new Response('{"ok":true}');});
  await read('bots.info',{bot:'B12345678'});
@@ -504,4 +562,21 @@ test('Slack outbound does not post after shutdown during membership lookup',asyn
  const outbound=slack.createSlackOutbound(api,config,store,true,()=>stopping);const work=outbound.send(thread,'answer','nonce');stopping=true;
  release({ok:true,channel:{id:channel,is_member:true,is_channel:true,is_im:false,is_mpim:false}});
  try{await assert.rejects(work);assert.equal(posts,0);}finally{store.close();}
+});
+
+test('Slack new roots survive bootstrap uncertainty, dedupe events, and distinguish full from global block',async()=>{
+ const t=setup(false);let calls=0;t.engine.backend.createSession=async()=>{if(++calls===1)throw Error('unknown bootstrap');return 'new-session';};
+ try{const first=message('1700000000.000101');await t.bot.handle(first);await t.engine.waitForIdle();assert.equal(t.store.counts().uncertain,1);await t.bot.handle(first);assert.equal(calls,1);await t.bot.handle(message('1700000000.000102'));await t.engine.waitForIdle();assert.equal(t.store.requestBySource(`${config.guildId}:${config.channelId}:1700000000.000102`)?.state,'completed');}finally{t.engine.close();await t.engine.waitForIdle();t.store.close();}
+ const full=setup();try{for(let i=1;i<=5;i++)await full.bot.handle(message('1700000000.00020'+i));await full.bot.handle(message('1700000000.000206'));const text=String(full.sent.at(-1)?.body.text);assert.match(text,/5개/);assert.ok(!text.includes('불명확'));}finally{full.engine.close();full.store.close();}
+ const blocked=setup();try{await blocked.bot.handle(message());const req=blocked.store.requestBySource(`${config.guildId}:${config.channelId}:1700000000.000001`)!;blocked.store.startRequest(req.id);blocked.store.transition(req.id,'running','uncertain','execution_unknown');await blocked.bot.handle(message('1700000000.000002'));const text=String(blocked.sent.at(-1)?.body.text);assert.match(text,/원격 실행 결과/);assert.ok(!text.includes('가득'));}finally{blocked.engine.close();blocked.store.close();}
+});
+
+test('closed Aside profile explains recovery without accepting or executing the question',async()=>{
+ const t=setup();try{
+  t.engine.settings!.readPreset=async()=>{throw Object.assign(Error('must not surface private diagnostic'),{code:'aside_profile_window_closed'});};
+  await t.bot.handle(message());
+  assert.equal(t.store.pendingCount(),0);assert.equal(t.store.db.prepare('SELECT COUNT(*) n FROM sessions').get()!.n,0);
+  const reply=String(t.sent.find(x=>x.method==='chat.postMessage')?.body.text);
+  assert.match(reply,/u0/);assert.match(reply,/창/);assert.doesNotMatch(reply,/private/);
+ }finally{t.store.close();}
 });

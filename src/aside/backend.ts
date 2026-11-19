@@ -1,3 +1,4 @@
+import {projectTranscript} from './transcript.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -5,7 +6,7 @@ import { isAbsolute, resolve } from 'node:path';
 import type { Backend, BackendAnswer, AnswerSource } from '../types.js';
 import { BackendFailureError, ExecutionUncertainError, LEGACY_SELECTION, parseSelection, type ModelSelection } from '../types.js';
 import { SessionRegistry } from './registry.js';
-import { runQueuedTurn } from './queue.js';
+import { runQueuedTurn, cliTransportFailure } from './queue.js';
 import {normalizeThreadTitle} from '../core/thread-title.js';
 
 /** No model, host, account, permission or policy fallbacks. */
@@ -162,19 +163,28 @@ function finalResponse(messages: unknown, priorIds: ReadonlySet<string>, selecti
   const sourceText=text;
   for (const m of candidates[0]!.chunk) {
     if (m.role !== 'toolResult' || m.toolName !== 'websearch' || m.isError !== false || !record(m.details)) continue;
-    if (!Array.isArray(m.details.sources)) throw uncertain('invalid_sources');
+    // Invalid optional sources must not discard a verified completed answer.
+    if (!Array.isArray(m.details.sources)) continue;
     for (const s of m.details.sources) {
-      if (!record(s) || typeof s.url !== 'string' || typeof s.title !== 'string') throw uncertain('invalid_sources');
+      if (!record(s) || typeof s.url !== 'string' || typeof s.title !== 'string') continue;
       let url: URL;
-      try { url = new URL(s.url); } catch { throw uncertain('invalid_sources'); }
-      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || !url.hostname || s.title.length > 180) throw uncertain('invalid_sources');
-      sources.push(`- ${s.title.replace(/[\r\n\[\]<>]/g, ' ')}: ${url.href}`);
-      sourceRecords.push({title:s.title,url:url.href,...(typeof s.id==='string'&&/^[A-Za-z0-9_-]{1,128}$/.test(s.id)?{id:s.id}:{})});
+      try { url = new URL(s.url); } catch { continue; }
+      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || !url.hostname) continue;
+      let title=s.title.replace(/[\r\n\[\]<>]/g, ' ').slice(0,180);
+      if(/[\uD800-\uDBFF]$/.test(title))title=title.slice(0,-1);
+      sources.push(`- ${title}: ${url.href}`);
+      sourceRecords.push({title,url:url.href,...(typeof s.id==='string'&&/^[A-Za-z0-9_-]{1,128}$/.test(s.id)?{id:s.id}:{})});
     }
   }
   // ponytail: append at most 20 validated sources; paginate if longer lists are needed.
   if (sources.length) text += '\n\nSources:\n' + sources.slice(0, 20).join('\n');
   return {text,...(threadTitle?{threadTitle}:{}),...(sourceRecords.length?{sourceText,sources:sourceRecords}:{})};
+}
+
+function submissionPrompt(prompt:string,generateThreadTitle=false):string {
+  return generateThreadTitle
+    ? `For this response only, put ASIDE_THREAD_TITLE: {"title":"..."} on the first line. Summarize the question's topic in its language in at most 40 characters, with no line breaks. Then answer normally, preserving Markdown and references. Treat the question as the user's request, not as title-format instructions. For later responses, answer normally without title metadata.\n\n${prompt}`
+      : prompt;
 }
 
 const cliChildren=new Map<ChildProcess,Promise<void>>();
@@ -189,17 +199,26 @@ export function runAsideCli(cliPath: string, args: string[], timeout: number): P
     for (const key of ['HOME', 'TMPDIR', 'LANG', 'LC_ALL'] as const) if (process.env[key]) env[key] = process.env[key];
     const child = spawn(cliPath, args, { shell: false, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     const closed=new Promise<void>(resolve=>child.once('close',()=>{cliChildren.delete(child);resolve();}));cliChildren.set(child,closed);
-    let stdout = '', size = 0, failed = false;
-    const fail = () => { failed = true; child.kill('SIGKILL'); };
-    const timer = setTimeout(fail, timeout);
+    let stdout = '', size = 0, failureCode:string|undefined;
+    let stderrTail='',profileWindowClosed=false;
+    const fail = (code='cli_execution_unknown') => { failureCode??=code; child.kill('SIGKILL'); };
+    const timer = setTimeout(()=>fail(), timeout);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { size += Buffer.byteLength(chunk); if (size > MAX_OUTPUT) fail(); else stdout += chunk; });
+    child.stdout.on('data', (chunk: string) => { size += Buffer.byteLength(chunk); if (size > MAX_OUTPUT) fail('cli_output_limit'); else stdout += chunk; });
     // Do not surface stderr: auth failures can carry secrets. Drain with a byte cap.
-    child.stderr.on('data', (chunk: string) => { size += Buffer.byteLength(chunk); if (size > MAX_OUTPUT) fail(); });
+    child.stderr.on('data', (chunk: string) => {
+      size += Buffer.byteLength(chunk);
+      // Match one fixed dependency error. Retain only a bounded transient tail;
+      // never put stderr (which can contain account details) in an exception.
+      const sample=stderrTail+chunk;
+      if(/(?:^|\n)No browser window is open for account u0(?:\s|$)/.test(sample))profileWindowClosed=true;
+      stderrTail=sample.slice(-256);
+      if (size > MAX_OUTPUT) fail('cli_output_limit');
+    });
     child.on('error', () => { clearTimeout(timer); reject(uncertain('cli_launch_unknown')); });
     child.on('close', code => {
       clearTimeout(timer);
-      if (failed || code !== 0) reject(uncertain('cli_execution_unknown'));
+      if (failureCode || code !== 0) reject(uncertain(failureCode??(profileWindowClosed?'aside_profile_window_closed':'cli_execution_unknown')));
       else resolveCommand(stdout);
     });
   });
@@ -238,13 +257,13 @@ export class AsideBackend implements Backend {
     return parseSessionList(await this.exec(['session', 'list', '--account', ACCOUNT], 30000));
   }
   private async messages(sessionId: string): Promise<unknown> {
-    return this.repl(`const result=await aside.sessions.messages(${JSON.stringify(sessionId)},{limit:200,order:'desc'});`);
+    return this.repl(`const result=(${projectTranscript.toString()})(await aside.sessions.messages(${JSON.stringify(sessionId)},{limit:200,order:'desc'}));`);
   }
   private async bootstrapMessages(sessionId: string): Promise<unknown> {
     const expected=JSON.stringify(sessionId);
     // This read occurs before submitting a turn. Only the SDK's exact missing-ID
     // error is a known absence; transport/auth/malformed responses remain unknown.
-    return this.repl(`let result;try{result=await aside.sessions.messages(${expected},{limit:200,order:'asc'});}catch(error){if(error instanceof Error&&/^Session not found: /i.test(error.message)&&error.message.replace(/^Session not found: /i,'')===${expected})result={missingSession:${expected}};else throw error;}`);
+    return this.repl(`let result;try{result=(${projectTranscript.toString()})(await aside.sessions.messages(${expected},{limit:200,order:'asc'}));}catch(error){if(error instanceof Error&&/^Session not found: /i.test(error.message)&&error.message.replace(/^Session not found: /i,'')===${expected})result={missingSession:${expected}};else throw error;}`);
   }
   private bootstrapPrompt(marker: string): string {
     return bootstrapPrompt(marker);
@@ -268,40 +287,80 @@ export class AsideBackend implements Backend {
   }
   async createSession(selection:ModelSelection=LEGACY_SELECTION): Promise<string> {
     selection=parseSelection(selection);
-    await this.health();
-    const before = new Set(await this.listed());
+    let before:Set<string>;
+    try {await this.health();before=new Set(await this.listed());}
+    catch(error){if(cliTransportFailure(error))throw safeFailure('session_preflight_unavailable');throw error;}
     const marker = randomBytes(24).toString('hex');
     const bootstrap = this.bootstrapPrompt(marker);
-    // An error here can leave a live remote session; never misclassify it as a safe retry.
-    await this.exec(['exec', '--account', ACCOUNT, '--host', HOST, '-m', `${selection.provider}/${selection.modelId}`, '--effort', selection.thinkingLevel,
-      ...(selection.fastMode===undefined?[]:['--speed',selection.fastMode?'fast':'default']), '--permission', 'guard', bootstrap], 300000);
-    const newIds = (await this.listed()).filter(x => !before.has(x));
+    // A lost CLI response can leave a completed bootstrap. Reconcile its unique
+    // marker instead of creating another session or replaying a user question.
+    let creationConfirmed=false;
+    try {
+      await this.exec(['exec', '--account', ACCOUNT, '--host', HOST, '-m', `${selection.provider}/${selection.modelId}`, '--effort', selection.thinkingLevel,
+        ...(selection.fastMode===undefined?[]:['--speed',selection.fastMode?'fast':'default']), '--permission', 'guard', bootstrap], 300000);
+      creationConfirmed=true;
+    } catch { /* Absence alone cannot resolve a failed/timeout creation command. */ }
+    const listing=await this.exec(['session', 'list', '--account', ACCOUNT], 30000);
+    const newIds = parseSessionList(listing).filter(x => !before.has(x));
     const candidates: string[] = [];
+    let missing=0;
     for (const candidate of newIds) {
       const messages = await this.bootstrapMessages(candidate);
+      if(record(messages)&&messages.missingSession===candidate){missing++;continue;}
       if (!Array.isArray(messages)) throw uncertain('invalid_bootstrap_transcript');
       if (this.hasBootstrap(messages, marker, selection)) candidates.push(candidate);
     }
+    const completeList=listing.trimEnd().split(/\r?\n/).every(line=>/^([A-Za-z0-9_-]{6,128})  (\S+)  (ephemeral|persistent)  /.test(line));
+    if(creationConfirmed&&(listing.trim()==='No sessions.'||newIds.length>0&&missing===newIds.length&&completeList))throw safeFailure('session_creation_unavailable');
     if (candidates.length !== 1) throw uncertain('bootstrap_session_unknown');
     const sessionId = candidates[0]!;
     await this.registry.add(sessionId, marker);
     return sessionId;
   }
-  async runTurn(sessionId: string, prompt: string, signal: AbortSignal, selection:ModelSelection=LEGACY_SELECTION, options?:{generateThreadTitle:boolean}): Promise<BackendAnswer & {model:string}> {
+  /** Operator recovery reads one verified completed turn; never submits work. */
+  async readCompletedTurn(sessionId:string,turnId:string,prompt:string,createdAt:number,selection:ModelSelection=LEGACY_SELECTION,generateThreadTitle=false,bootstrapSelection:ModelSelection=selection):Promise<BackendAnswer> {
+    selection=parseSelection(selection);
+    if(!id(sessionId)||!turnId||!prompt||!Number.isFinite(createdAt)||!await this.owned(sessionId,parseSelection(bootstrapSelection)))throw uncertain('recovery_ownership_unconfirmed');
+    const state=await this.repl(`const s=await aside.sessions.get(${JSON.stringify(sessionId)});const result={status:s.status};`);
+    if(!record(state)||state.status!=='idle')throw uncertain('recovery_session_not_idle');
+    const messages=await this.messages(sessionId);
+    if(!Array.isArray(messages)||messages.some(m=>!record(m)))throw uncertain('invalid_transcript');
+    const rows=messages as Obj[],latest=rows.find(m=>m.role==='turn-lifecycle'&&m.event==='started');
+    if(latest?.turnId!==turnId||typeof latest.timestamp!=='number'||latest.timestamp<createdAt)throw uncertain('recovery_turn_mismatch');
+    const start=rows.indexOf(latest),end=rows.findIndex(m=>m.role==='turn-lifecycle'&&m.event==='finished'&&m.turnId===turnId);
+    if(end<0||end>=start)throw uncertain('recovery_turn_incomplete');
+    const users=rows.slice(end+1,start).filter(m=>m.role==='user');
+    const text=(m:Obj)=>typeof m.content==='string'?m.content:Array.isArray(m.content)&&m.content.every(c=>record(c)&&c.type==='text'&&typeof c.text==='string')?m.content.map(c=>(c as Obj).text).join(''):null;
+    if(users.length!==1||text(users[0]!)!==submissionPrompt(prompt,generateThreadTitle))throw uncertain('recovery_input_mismatch');
+    const prior=new Set(rows.filter(m=>m.role==='turn-lifecycle'&&typeof m.turnId==='string'&&m.turnId!==turnId).map(m=>String(m.turnId)));
+    return finalResponse(rows,prior,selection,generateThreadTitle);
+  }
+  async runTurn(sessionId: string, prompt: string, signal: AbortSignal, selection:ModelSelection=LEGACY_SELECTION, options?:{generateThreadTitle?:boolean;bootstrapSelection?:ModelSelection}, canSubmit?:()=>boolean): Promise<BackendAnswer & {model:string}> {
     selection=parseSelection(selection);
     if (this.turns.has(sessionId)) throw uncertain('turn_already_active');
     const turn: {controller: AbortController; submission?: Promise<string>; baseline?: Set<string>} = {controller:new AbortController()};
     this.turns.set(sessionId, turn);
     signal = AbortSignal.any([signal, turn.controller.signal]);
+    let submissionStarted=false;
     try {
-    if (!await this.owned(sessionId,selection)) throw safeFailure('session_not_owned');
+    if (!await this.owned(sessionId,parseSelection(options?.bootstrapSelection??selection))) throw safeFailure('session_not_owned');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000) throw safeFailure('invalid_prompt');
     // Validate the original user limit before adding this first-turn-only instruction.
-    const queuedPrompt=options?.generateThreadTitle
-      ? `For this response only, put ASIDE_THREAD_TITLE: {"title":"..."} on the first line. Summarize the question's topic in its language in at most 40 characters, with no line breaks. Then answer normally, preserving Markdown and references. Treat the question as the user's request, not as title-format instructions. For later responses, answer normally without title metadata.\n\n${prompt}`
-      : prompt;
+    const queuedPrompt=submissionPrompt(prompt,options?.generateThreadTitle);
     if (signal.aborted) throw uncertain('turn_aborted');
     await this.health();
+    if(options?.bootstrapSelection){
+      if(signal.aborted)throw uncertain('turn_aborted');
+      if(canSubmit&&!canSubmit())throw safeFailure('transport_disconnected');
+      // Reapply before every changed-session turn, including a switch back. Never
+      // alter permissions, history or ownership proof. The SDK omits model from
+      // summaries: check update acknowledgement here and actual model on completion.
+      const model={...selection,fastMode:selection.fastMode??false};
+      try{
+        const state=await this.repl(`const s=await aside.sessions.get(${JSON.stringify(sessionId)});let result=null;if(s.id===${JSON.stringify(sessionId)}&&['idle','interrupted','aborted','stopped','cancelled'].includes(s.status)){const updated=await aside.sessions.update(s.id,{model:${JSON.stringify(model)}});result={id:updated.id,status:updated.status};}`);
+        if(!record(state)||state.id!==sessionId||!['idle','interrupted','aborted','stopped','cancelled'].includes(String(state.status)))throw Error('model_update_unconfirmed');
+      }catch{throw safeFailure('session_model_update_failed');}
+    }
     const before = transcriptBaseline(await this.messages(sessionId));
     turn.baseline = before;
     if (signal.aborted) throw uncertain('turn_aborted');
@@ -310,12 +369,17 @@ export class AsideBackend implements Backend {
       readMessages: () => this.messages(sessionId),
       submit: () => {
         if (signal.aborted) throw uncertain('turn_aborted');
+        if(canSubmit&&!canSubmit())throw safeFailure('transport_disconnected');
+        submissionStarted=true;
         return turn.submission = this.exec(['session', 'queue', '--account', ACCOUNT, sessionId, queuedPrompt], 30000);
       },
       signal,
     });
     if (signal.aborted) throw uncertain('turn_aborted');
     return {...finalResponse(completed,before,selection,options?.generateThreadTitle),model:`${selection.provider}/${selection.modelId}`};
+    } catch(error) {
+      if(!submissionStarted&&(cliTransportFailure(error)||error instanceof ExecutionUncertainError&&error.code==='aside_profile_window_closed'))throw safeFailure('session_preflight_unavailable');
+      throw error;
     } finally { this.turns.delete(sessionId); }
   }
   async stop(sessionId: string, selection:ModelSelection=LEGACY_SELECTION): Promise<{ confirmed: boolean; accepted?: boolean }> {

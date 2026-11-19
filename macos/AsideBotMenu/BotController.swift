@@ -27,10 +27,11 @@ struct QuitState {
  mutating func fail()->Bool {waiting=false;readyToExit=false;let hadReply=pendingReply;pendingReply=false;return hadReply}
 }
 enum MenuState {case normal,progress,stopped,warning}
-func aggregate(_ bots:[Platform:BotViewState])->MenuState {
- let states=Platform.allCases.map{bots[$0]?.phase ?? "unknown"}
- if states.allSatisfy({$0=="connected"}) && bots.values.allSatisfy({$0.safeErrorCode==nil}){return .normal}
- if states.contains(where:{$0=="error"||$0=="unknown"})||bots.values.contains(where:{$0.safeErrorCode != nil}){return .warning}
+func aggregate(_ bots:[Platform:BotViewState],platforms:[Platform]=[.slack])->MenuState {
+ let selected=platforms.map{bots[$0] ?? BotViewState(phase:"unknown")}
+ let states=selected.map{$0.phase}
+ if states.allSatisfy({$0=="connected"}) && selected.allSatisfy({$0.safeErrorCode==nil}){return .normal}
+ if states.contains(where:{$0=="error"||$0=="unknown"})||selected.contains(where:{$0.safeErrorCode != nil}){return .warning}
  if states.allSatisfy({$0=="stopped"}){return .stopped}
  if states.contains("stopped"){return .warning}
  return .progress
@@ -121,6 +122,7 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
 @MainActor final class BotController {
  private let discoverServices:ServiceDiscovery
  let projectURL:URL,nodeURL:URL
+ let platforms:[Platform]
  var preventSleep:Bool
  var slackOverride:String?
  private let logDirectory:URL?
@@ -133,7 +135,7 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
  private enum Recovery {case available,pending,spent}
  private var recovery=Recovery.spent
  private(set) var conflict=false
- init(projectURL:URL,nodeURL:URL,preventSleep:Bool,logDirectory:URL?=nil,discoverServices:@escaping ServiceDiscovery={project in try await Task.detached{try findConflictingServices(project:project)}.value}){self.discoverServices=discoverServices;self.logDirectory=logDirectory;self.projectURL=projectURL.resolvingSymlinksInPath();self.nodeURL=nodeURL.resolvingSymlinksInPath();self.preventSleep=preventSleep}
+ init(projectURL:URL,nodeURL:URL,preventSleep:Bool,platforms:[Platform]=[.slack],logDirectory:URL?=nil,discoverServices:@escaping ServiceDiscovery={project in try await Task.detached{try findConflictingServices(project:project)}.value}){self.platforms=platforms;self.discoverServices=discoverServices;self.logDirectory=logDirectory;self.projectURL=projectURL.resolvingSymlinksInPath();self.nodeURL=nodeURL.resolvingSymlinksInPath();self.preventSleep=preventSleep}
  private var environment:[String:String]{
   var env=["HOME":FileManager.default.homeDirectoryForCurrentUser.path,"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","LANG":"en_US.UTF-8"]
   if let tmp=ProcessInfo.processInfo.environment["TMPDIR"]{env["TMPDIR"]=tmp}
@@ -142,7 +144,7 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
  }
  private func paths()throws {
   let fm=FileManager.default
-  guard fm.isExecutableFile(atPath:nodeURL.path),fm.fileExists(atPath:projectURL.appendingPathComponent("dist/scripts/prepare-bots.js").path),Platform.allCases.allSatisfy({fm.fileExists(atPath:entry($0).path)}) else{throw ManagerError("build_missing")}
+  guard fm.isExecutableFile(atPath:nodeURL.path),fm.fileExists(atPath:projectURL.appendingPathComponent("dist/scripts/prepare-bots.js").path),platforms.allSatisfy({fm.fileExists(atPath:entry($0).path)}) else{throw ManagerError("build_missing")}
   let json=try JSONSerialization.jsonObject(with:Data(contentsOf:projectURL.appendingPathComponent("config.local.json"))) as? [String:Any]
   guard let path=json?["dataDir"] as? String,path.hasPrefix("/") else{throw ManagerError("config_invalid")}
   guard fm.fileExists(atPath:projectURL.appendingPathComponent("config.slack.local.json").path) else{throw ManagerError("config_invalid")}
@@ -199,23 +201,23 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
   }
   if recovery == .pending,!conflict,!starting,!stopping,processes.isEmpty {
    recovery = .spent
-   try? await startBoth(recovering:true)
+   try? await startBots(recovering:true)
   }
  }
  func invalidate(){for platform in Platform.allCases where bots[platform]?.phase != "stopped"{bots[platform]?.phase="unknown";bots[platform]?.lastReplyUptime=nil};onChange?()}
- func startBoth() async throws {try await startBoth(recovering:false)}
- private func startBoth(recovering:Bool) async throws {
+ func startBots() async throws {try await startBots(recovering:false)}
+ private func startBots(recovering:Bool) async throws {
   guard !starting,!stopping,processes.isEmpty else{throw ManagerError("service_already_running")}
   if !recovering{recovery = .available}
   starting=true;startCancelled=false;defer{starting=false;onChange?()}
   do{
    try paths();guard (try await discoverServices(projectURL)).isEmpty else{throw ManagerError("launchagent_conflict")}
    guard !startCancelled else{throw ManagerError("shutdown_pending")}
-   for platform in Platform.allCases {guard try lockIdentity(platform)==nil else{throw ManagerError("service_already_running")}}
-   for platform in Platform.allCases{bots[platform]=BotViewState(phase:"starting",ownership:"managed")};onChange?()
+   for platform in platforms {guard try lockIdentity(platform)==nil else{throw ManagerError("service_already_running")}}
+   for platform in platforms{bots[platform]=BotViewState(phase:"starting",ownership:"managed")};onChange?()
    let prep=process(projectURL.appendingPathComponent("dist/scripts/prepare-bots.js"));preparing=prep;try prep.run();while prep.isRunning{try await Task.sleep(nanoseconds:100000000)};preparing=nil
    guard !startCancelled,prep.terminationStatus==0 else{throw ManagerError("aside_unavailable")}
-   for platform in Platform.allCases {
+   for platform in platforms {
     guard !startCancelled else{throw ManagerError("shutdown_pending")}
     var random=[UInt8](repeating:0,count:32);guard SecRandomCopyBytes(kSecRandomDefault,random.count,&random)==errSecSuccess else{throw ManagerError("invalid_owner")};let token=random.map{String(format:"%02x",$0)}.joined()
     let child=process(entry(platform));var env=environment;env["ASIDE_MENU_MANAGED"]="1";child.environment=env;let input=Pipe();child.standardInput=input
@@ -233,8 +235,8 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
     guard !startCancelled else{throw ManagerError("shutdown_pending")}
     let claimed=try await channel.request(["op":"claim","instanceId":status.status.instanceId,"token":token]);guard claimed.ok else{throw ManagerError(claimed.code ?? "invalid_owner")};try accept(claimed,platform:platform)
    }
-   guard processes.count==2,processes.values.allSatisfy({$0.isRunning}) else{throw ManagerError("process_exited")}
-  }catch{starting=false;await stopBothIgnoringFailure();for platform in Platform.allCases{bots[platform]?.safeErrorCode=(error as? ManagerError)?.code ?? "start_failed"};throw error}
+   guard processes.count==platforms.count,processes.values.allSatisfy({$0.isRunning}) else{throw ManagerError("process_exited")}
+  }catch{starting=false;await stopBotsIgnoringFailure();for platform in platforms{bots[platform]?.safeErrorCode=(error as? ManagerError)?.code ?? "start_failed"};throw error}
  }
  private func childExited(_ platform:Platform) async {
   guard let child=processes[platform],!child.isRunning else{return}
@@ -246,11 +248,11 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
   }
   let code=expected ? nil:"process_exited"
   bots[platform]=BotViewState(phase:"stopped",safeErrorCode:code);appendSafeEvent(platform:platform,code:code ?? "stopped",stage:"shutdown",folder:logDirectory);onChange?()
-  if !stopping && !starting && !processes.isEmpty {await stopBothIgnoringFailure()}
+  if !stopping && !starting && !processes.isEmpty {await stopBotsIgnoringFailure()}
   await channel?.close()
  }
- private func stopBothIgnoringFailure() async {try? await stopManagedBots()}
- func stopBoth() async throws {
+ private func stopBotsIgnoringFailure() async {try? await stopManagedBots()}
+ func stopBots() async throws {
   recovery = .spent
   try await stopManagedBots()
  }
@@ -258,19 +260,19 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
   if let task=stopTask{return try await task.value}
   stopping=true;startCancelled=true;preparing?.terminate();for platform in processes.keys{bots[platform]?.phase="stopping"};onChange?()
   let task=Task{@MainActor in
-   for platform in Platform.allCases {
+   for platform in self.platforms {
     guard let child=self.processes[platform],child.isRunning else{continue}
     if let channel=self.channels[platform],let instance=self.instanceIDs[platform] {let accepted=try? await channel.request(["op":"shutdown","instanceId":instance]);if accepted?.ok != true{await channel.close()}}
     else {guard let saved=self.identities[platform],let identity=try inspectProcess(child.processIdentifier),sameProcess(saved,identity),self.identityMatches(identity,entry:self.entry(platform)) else{throw ManagerError("identity_unknown")};guard let again=try inspectProcess(identity.pid),sameProcess(identity,again) else{throw ManagerError("identity_unknown")};kill(identity.pid,SIGTERM)}
    }
    while self.starting||self.preparing?.isRunning==true||self.processes.values.contains(where:{$0.isRunning}) {try await Task.sleep(nanoseconds:100000000)}
-   for platform in Platform.allCases{await self.childExited(platform)}
+   for platform in self.platforms{await self.childExited(platform)}
   };stopTask=task
   do{try await task.value;stopTask=nil;stopping=false;onChange?()}catch{stopTask=nil;for platform in processes.keys{bots[platform]?.phase="error";bots[platform]?.safeErrorCode="shutdown_pending"};onChange?();throw error}
  }
  func setSleep(_ enabled:Bool) async {
   preventSleep=enabled
-  for platform in Platform.allCases {
+  for platform in platforms {
    guard bots[platform]?.ownership=="managed",let channel=channels[platform],let instance=instanceIDs[platform] else{continue}
    do{let reply=try await channel.request(["op":"setSleep","instanceId":instance,"enabled":enabled]);try accept(reply,platform:platform);if !reply.ok{bots[platform]?.safeErrorCode=reply.code ?? "sleep_unavailable"}}catch{await channel.close();bots[platform]?.safeErrorCode="sleep_unavailable"}
   };onChange?()
@@ -282,10 +284,13 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
   guard (try await discoverServices(projectURL)).isEmpty else{throw ManagerError("launchagent_conflict")}
   guard !startCancelled else{throw ManagerError("shutdown_pending")}
   var targets=[ProcessIdentity](),children=[ProcessIdentity]()
-  for platform in Platform.allCases {
+  for platform in platforms {
    guard let child=try lockIdentity(platform) else{continue};children.append(child)
    guard let parent=try inspectProcess(child.parentPID) else{throw ManagerError("identity_unknown")}
-   if identityMatches(parent,entry:projectURL.appendingPathComponent("scripts/start-bots.mjs")){if !targets.contains(parent){targets.append(parent)}}
+   if identityMatches(parent,entry:projectURL.appendingPathComponent("scripts/start-bots.mjs")){
+    guard Platform.allCases.allSatisfy({platforms.contains($0)}) else{throw ManagerError("identity_unknown")}
+    if !targets.contains(parent){targets.append(parent)}
+   }
    else if ["/bin/bash","/bin/zsh","/bin/sh"].contains(parent.executable){targets.append(child)}
    else{throw ManagerError("identity_unknown")}
   }
@@ -293,6 +298,6 @@ func makeMenuRefreshTimer(interval:TimeInterval=2, tick:@escaping @Sendable ()->
   for target in targets {guard !startCancelled else{throw ManagerError("shutdown_pending")};guard let current=try inspectProcess(target.pid),sameProcess(target,current) else{throw ManagerError("identity_unknown")};guard kill(target.pid,SIGTERM)==0 else{throw ManagerError("identity_unknown")}}
   let deadline=ProcessInfo.processInfo.systemUptime+30
   for target in targets+children {while let current=try inspectProcess(target.pid),sameProcess(target,current){guard !startCancelled,ProcessInfo.processInfo.systemUptime<deadline else{throw ManagerError("shutdown_pending")};try await Task.sleep(nanoseconds:100000000)}}
-  guard !startCancelled else{throw ManagerError("shutdown_pending")};starting=false;try await startBoth()
+  guard !startCancelled else{throw ManagerError("shutdown_pending")};starting=false;try await startBots()
  }
 }

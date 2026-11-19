@@ -34,9 +34,21 @@ test('edits serialize and never report success after a mismatching save',async()
  assert.equal(rejected.writes.length,1);
 });
 
+test('requested Sol and Astra preset edits round-trip while preserving unrelated settings',async()=>{
+ const t=await settingsFixture(),before=structuredClone(t.values);
+ await Reflect.apply(t.settings.editPreset,t.settings,['standard','gpt-6.1-sol','high']);
+ await Reflect.apply(t.settings.editPreset,t.settings,['deep','gpt-6-astra','medium']);
+ assert.deepEqual(await t.settings.readPreset('standard'),{provider:'openai-codex',modelId:'gpt-6.1-sol',thinkingLevel:'high',fastMode:false});
+ assert.deepEqual(await t.settings.readPreset('deep'),{provider:'openai-codex',modelId:'gpt-6-astra',thinkingLevel:'medium',fastMode:false});
+ const expected=structuredClone(before) as {modelCategories:typeof categories};
+ expected.modelCategories.standard.modelId='gpt-6.1-sol';expected.modelCategories.standard.thinkingLevel='high';
+ expected.modelCategories.deep.modelId='gpt-6-astra';expected.modelCategories.deep.thinkingLevel='medium';
+ assert.deepEqual(t.values,expected);
+});
+
 test('shared definitions reject unsupported models, ultrabrowse and invalid categories before writing',async()=>{
  const t=await settingsFixture();
- for(const [name,model,effort] of [['visual','gpt-6-sol','high'],['fast','gpt-6-astra','high'],['fast','gpt-6-luna','ultrabrowse']])await assert.rejects(Reflect.apply(t.settings.editPreset,t.settings,[name,model,effort]));
+ for(const [name,model,effort] of [['visual','gpt-6-sol','high'],['fast','unsupported','high'],['fast','gpt-6-luna','ultrabrowse']])await assert.rejects(Reflect.apply(t.settings.editPreset,t.settings,[name,model,effort]));
  assert.equal(t.writes.length,0);
  (t.values.modelCategories as typeof categories).standard.modelId='unsupported';
  await assert.rejects(t.settings.readPreset('standard'));

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import {LEGACY_SELECTION,parseSelection,presetName,type BotConfig,type ModelSelection,type PresetName,type RequestState,type ThreadBinding} from './types.js';
+import {DeliveryFailure,LEGACY_SELECTION,parseSelection,presetName,type BotConfig,type ModelSelection,type PresetName,type RequestState,type ThreadBinding} from './types.js';
 
 export interface SessionRow extends ThreadBinding {
   backendId: string | null;
@@ -8,6 +8,7 @@ export interface SessionRow extends ThreadBinding {
   originId: string | null;
   presetName:PresetName|null;
   selection:ModelSelection;
+  bootstrapSelection?:ModelSelection;
   comparisonRequestId:number|null;
 }
 export interface RequestRow {
@@ -70,17 +71,23 @@ export class Store {
       );`);
     // Add columns without replacing existing bindings, requests, triggers or data.
     for(const [table,columns] of Object.entries({
-      sessions:{preset_name:'TEXT',model_selection:'TEXT',comparison_request_id:'INTEGER'},
+      sessions:{preset_name:'TEXT',model_selection:'TEXT',comparison_request_id:'INTEGER',bootstrap_model_selection:'TEXT'},
       requests:{model_selection:'TEXT',actual_model:'TEXT',input_kind:"TEXT NOT NULL DEFAULT 'message'",reference_request_id:'INTEGER'},
-      outbox:{kind:"TEXT NOT NULL DEFAULT 'notice'",is_last:'INTEGER NOT NULL DEFAULT 0'},
+      outbox:{kind:"TEXT NOT NULL DEFAULT 'notice'",is_last:'INTEGER NOT NULL DEFAULT 0',delivery_outcome:'TEXT',delivery_stage:'TEXT',delivery_code:'TEXT',http_status:'INTEGER',diagnosed_at:'INTEGER'},
     })){
       const present=new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as {name:string}[]).map(row=>row.name));
       for(const [column,definition] of Object.entries(columns))if(!present.has(column))this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
     this.db.exec(`CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      DROP TRIGGER IF EXISTS immutable_selection;
       CREATE TRIGGER IF NOT EXISTS immutable_selection BEFORE UPDATE OF preset_name,model_selection ON sessions
-      WHEN OLD.model_selection IS NOT NULL AND (NEW.model_selection IS NOT OLD.model_selection OR NEW.preset_name IS NOT OLD.preset_name)
-      BEGIN SELECT RAISE(ABORT, 'immutable model selection'); END;`);
+      WHEN (NEW.model_selection IS NOT OLD.model_selection OR NEW.preset_name IS NOT OLD.preset_name)
+        AND (NEW.bootstrap_model_selection IS NULL OR OLD.blocked=1 OR EXISTS
+          (SELECT 1 FROM requests WHERE thread_id=OLD.thread_id AND state IN ('queued','running','cancel_requested','uncertain')))
+      BEGIN SELECT RAISE(ABORT, 'model selection change rejected'); END;
+      CREATE TRIGGER IF NOT EXISTS immutable_bootstrap_selection BEFORE UPDATE OF bootstrap_model_selection ON sessions
+      WHEN OLD.backend_id IS NOT NULL AND OLD.bootstrap_model_selection IS NOT NULL AND NEW.bootstrap_model_selection IS NOT OLD.bootstrap_model_selection
+      BEGIN SELECT RAISE(ABORT, 'immutable bootstrap selection'); END;`);
     // An interrupted remote execution has unknown state. Never auto-replay it.
     this.db.exec(`UPDATE requests SET state='uncertain',prompt=NULL,error_code='interrupted',updated_at=unixepoch('subsec')*1000
       WHERE state IN ('running','cancel_requested');
@@ -99,7 +106,20 @@ export class Store {
   session(threadId: string): SessionRow | undefined {
     const row = read<Record<string, unknown> | undefined>(this.db.prepare('SELECT * FROM sessions WHERE thread_id=?').get(threadId));
     return row && {threadId: String(row.thread_id),guildId: String(row.guild_id),parentChannelId:String(row.parent_channel_id),ownerUserId:String(row.owner_user_id),backendId:row.backend_id as string|null,blocked:Number(row.blocked),originId:row.origin_id as string|null,
-      presetName:row.preset_name===null?null:presetName(row.preset_name),selection:row.model_selection===null?{...LEGACY_SELECTION}:parseSelection(JSON.parse(String(row.model_selection))),comparisonRequestId:row.comparison_request_id===null?null:Number(row.comparison_request_id)};
+      presetName:row.preset_name===null?null:presetName(row.preset_name),selection:row.model_selection===null?{...LEGACY_SELECTION}:parseSelection(JSON.parse(String(row.model_selection))),
+      ...(row.bootstrap_model_selection===null?{}:{bootstrapSelection:parseSelection(JSON.parse(String(row.bootstrap_model_selection)))}),comparisonRequestId:row.comparison_request_id===null?null:Number(row.comparison_request_id)};
+  }
+  setThreadPreset(threadId:string,name:PresetName,selection:ModelSelection):boolean {
+    name=presetName(name);selection=parseSelection(selection);
+    return this.transaction(()=>{
+      const session=this.session(threadId);
+      if(!session||session.blocked||this.hasGlobalUncertainty()||this.busyInThread(threadId)
+        ||this.db.prepare("SELECT 1 FROM requests WHERE thread_id=? AND state='uncertain'").get(threadId))return false;
+      const bootstrap=session.backendId?(session.bootstrapSelection??session.selection):selection;
+      this.db.prepare('UPDATE sessions SET preset_name=?,model_selection=?,bootstrap_model_selection=? WHERE thread_id=?')
+        .run(name,JSON.stringify(selection),JSON.stringify(bootstrap),threadId);
+      return true;
+    });
   }
   sessionByOrigin(originId: string): SessionRow | undefined {
     const row = read<{thread_id:string}|undefined>(this.db.prepare('SELECT thread_id FROM sessions WHERE origin_id=?').get(originId));
@@ -121,6 +141,40 @@ export class Store {
   hasUncertain(): boolean {
     return !!this.db.prepare("SELECT 1 FROM requests WHERE state='uncertain' LIMIT 1").get();
   }
+  // Bootstrap creation does not receive the user question. Bound sessions and
+  // unknown turns/stops retain platform-wide protection.
+  hasGlobalUncertainty(): boolean { return this.globalBlockMessage()!==null; }
+  globalBlockMessage(): string|null {
+    if(this.db.prepare("SELECT 1 FROM requests r JOIN sessions s ON s.thread_id=r.thread_id WHERE r.state='uncertain' AND (r.error_code IS NULL OR r.error_code!='session_creation_unknown' OR s.backend_id IS NOT NULL) LIMIT 1").get())
+      return '원격 실행 결과를 확인하지 못해 이 플랫폼의 새 실행을 보류했습니다. 자동 재전송하지 않습니다. 운영자 확인이 필요합니다.';
+    // Chosen safety budget, not a measured account concurrency limit.
+    const count=this.db.prepare("SELECT COUNT(*) n FROM requests WHERE state='uncertain' AND error_code='session_creation_unknown'").get() as {n:number};
+    if(Number(count.n)>=3)return '세션 준비 결과가 불확실한 요청이 3건 누적되어 이 플랫폼의 새 실행을 보류했습니다. 준비용 작업 확인이 필요하며 자동 재시도하지 않습니다.';
+    return null;
+  }
+  reconcileWaiting(now=Date.now()): string[] {
+    return this.transaction(()=>{
+      const discarded:string[]=[];
+      const unknown=this.db.prepare("SELECT r.id,r.thread_id,r.error_code,s.backend_id FROM requests r JOIN sessions s ON s.thread_id=r.thread_id WHERE r.state='uncertain'").all() as Array<{id:number;thread_id:string;error_code:string|null;backend_id:string|null}>;
+      for(const row of unknown){
+        if(this.db.prepare('SELECT 1 FROM outbox WHERE request_id=? AND part=2147483647').get(row.id))continue;
+        const creation=row.error_code==='session_creation_unknown'&&row.backend_id===null;
+        this.insertOutputParts(row.id,row.thread_id,[creation
+          ? 'Aside 세션 준비 결과를 확인하지 못했습니다. 이 질문은 Aside에 제출하지 않았으며 자동 재시도하지 않습니다. 이 스레드는 격리했습니다. '+(this.globalBlockMessage()??'원하시면 새 스레드에 직접 질문해 주세요. 준비용 원격 작업은 운영자 확인이 필요합니다.')
+          : '원격 실행 결과를 확인하지 못했습니다. 중복 실행을 막기 위해 이 플랫폼의 새 실행을 보류하며 자동 재전송하지 않습니다. 상태 조회 후 운영자에게 확인을 요청해 주세요.'],2147483647,'notice');
+      }
+      const waiting=this.db.prepare("SELECT r.id,r.thread_id,r.source_id,s.blocked FROM requests r JOIN sessions s ON s.thread_id=r.thread_id WHERE r.state='queued' AND (s.blocked=1 OR r.created_at<=?)").all(now-15*60_000) as Array<{id:number;thread_id:string;source_id:string;blocked:number}>;
+      for(const row of waiting){
+        const code=row.blocked?'prior_request_uncertain':'queue_expired';
+        this.db.prepare("UPDATE requests SET state='failed',prompt=NULL,error_code=?,updated_at=? WHERE id=? AND state='queued'").run(code,now,row.id);
+        this.insertOutputParts(row.id,row.thread_id,[row.blocked
+          ? '같은 스레드의 이전 요청 상태가 불확실하여 이 대기 요청을 실행하지 않고 종료했습니다. '+(this.globalBlockMessage()??'상태 확인 후 새 스레드를 이용해 주세요. 자동 재전송하지 않습니다.')
+          : '대기 시간이 15분을 넘어 이 질문을 실행하지 않고 만료 처리했습니다. 필요하면 상태를 확인한 뒤 직접 다시 질문해 주세요. 자동 재전송하지 않습니다.'],2147483647,'notice');
+        discarded.push(row.source_id);
+      }
+      return discarded;
+    });
+  }
   pendingCount(): number {
     return Number(read<{n:number}>(this.db.prepare("SELECT COUNT(*) n FROM requests WHERE state='queued'").get()).n);
   }
@@ -140,7 +194,7 @@ export class Store {
     return this.transaction(() => {
       const duplicate = this.requestBySource(sourceId);
       if (duplicate) return {kind:'duplicate',requestId:duplicate.id,state:duplicate.state};
-      if (this.hasUncertain() || this.session(threadId)?.blocked) return {kind:'blocked' as const};
+      if (this.hasGlobalUncertainty() || this.session(threadId)?.blocked) return {kind:'blocked' as const};
       if (this.pendingCount() >= maxPending) return {kind:'full' as const};
       if(options.onlyIfLatest!==undefined&&(this.busyInThread(threadId)||this.latestAnswer(threadId)?.request.id!==options.onlyIfLatest))return {kind:'stale' as const};
       const now=Date.now();
@@ -164,6 +218,10 @@ export class Store {
   }
   startRequest(id: number): boolean {
     return this.db.prepare("UPDATE requests SET state='running',updated_at=? WHERE id=? AND state='queued'").run(Date.now(),id).changes === 1;
+  }
+  /** Only before user submission: preserve the prompt and original expiry. */
+  deferUnsubmitted(id:number):boolean {
+    return this.db.prepare("UPDATE requests SET state='queued',updated_at=? WHERE id=? AND state='running' AND prompt IS NOT NULL").run(Date.now(),id).changes===1;
   }
   // All terminal transitions erase the queued prompt. No hidden chain-of-thought is stored.
   transition(id: number, from: RequestState, to: RequestState, code: string|null = null): boolean {
@@ -217,7 +275,7 @@ export class Store {
     }
   }
   outbox():OutboxRow[] {
-    return read<Array<Record<string,unknown>>>(this.db.prepare("SELECT * FROM outbox o WHERE state IN ('pending','sending') AND NOT EXISTS (SELECT 1 FROM outbox prior WHERE prior.request_id=o.request_id AND prior.part<o.part AND prior.state!='sent' AND prior.kind!='progress_notice') ORDER BY id").all()).map(r=>this.mapOutput(r));
+    return read<Array<Record<string,unknown>>>(this.db.prepare("SELECT * FROM outbox o WHERE state IN ('pending','sending') AND NOT EXISTS (SELECT 1 FROM outbox prior WHERE prior.request_id=o.request_id AND prior.part<o.part AND prior.state!='sent' AND prior.kind!='progress_notice' AND NOT (o.part=2147483647 AND prior.kind='queue_notice' AND prior.state='uncertain')) ORDER BY id").all()).map(r=>this.mapOutput(r));
   }
   discardPendingProgress(id:number):void {
     this.db.prepare("DELETE FROM outbox WHERE id=? AND kind='progress_notice' AND state='pending'").run(id);
@@ -225,8 +283,16 @@ export class Store {
   markSending(id:number):void { this.db.prepare("UPDATE outbox SET state='sending',attempted_at=COALESCE(attempted_at,?) WHERE id=? AND state IN ('pending','sending')").run(Date.now(),id); }
   markSent(id:number,messageId:string):void { this.db.prepare("UPDATE outbox SET state='sent',discord_message_id=? WHERE id=? AND state='sending'").run(messageId,id); }
   markDeliveryUncertain(id:number):void { this.db.prepare("UPDATE outbox SET state='uncertain' WHERE id=? AND state='sending'").run(id); }
+  recordDeliveryFailure(id:number,failure:DeliveryFailure):void {
+    // Retain the legacy quarantine state for rollback compatibility. The outcome
+    // distinguishes confirmed non-delivery from ambiguity without replaying either.
+    this.db.prepare("UPDATE outbox SET state='uncertain',delivery_outcome=?,delivery_stage=?,delivery_code=?,http_status=?,diagnosed_at=? WHERE id=? AND state='sending'").run(failure.outcome,failure.stage,failure.code,failure.httpStatus,Date.now(),id);
+  }
+  deliveryFailedCount(threadId?:string):number {
+    return Number((this.db.prepare(`SELECT COUNT(*) n FROM outbox WHERE state='uncertain' AND delivery_outcome='not_sent' AND kind!='progress_notice' ${threadId?'AND thread_id=?':''}`).get(...(threadId?[threadId]:[])) as {n:number}).n);
+  }
   deliveryUncertainCount(threadId?:string):number {
-    const row=read<{n:number}>(this.db.prepare(`SELECT COUNT(*) n FROM outbox WHERE state='uncertain' AND kind!='progress_notice' ${threadId?'AND thread_id=?':''}`).get(...(threadId?[threadId]:[])));
+    const row=read<{n:number}>(this.db.prepare(`SELECT COUNT(*) n FROM outbox WHERE state='uncertain' AND COALESCE(delivery_outcome,'unknown')!='not_sent' AND kind!='progress_notice' ${threadId?'AND thread_id=?':''}`).get(...(threadId?[threadId]:[])));
     return Number(row.n);
   }
   private mapOutput(r:Record<string,unknown>):OutboxRow {

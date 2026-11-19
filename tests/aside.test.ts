@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {runInNewContext} from 'node:vm';
 import { AsideBackend, CLI_VERSION, MODEL, READ_ONLY_POLICY, bootstrapPrompt, hasBootstrapTranscript, finalAnswer, parseReplJson, parseSessionList } from '../src/aside/backend.js';
 import { BackendFailureError, ExecutionUncertainError, type ModelSelection } from '../src/types.js';
 import { SessionRegistry } from '../src/aside/registry.js';
@@ -70,12 +71,22 @@ test('a registered session missing before submission fails safely without queuei
  }finally{f.cleanup();}
 });
 
-test('an unreadable or mismatched preflight transcript remains uncertain and never submits',async()=>{
- for(const unavailable of [false,true]){
+for (const code of ['cli_execution_unknown','aside_profile_window_closed']) test(`${code} during ownership reads is an unsubmitted failure`,async()=>{
+ const f=fixture(),marker='a'.repeat(48),calls:string[][]=[];
+ try{
+  await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123',marker);
+  const backend=new AsideBackend(f,async args=>{calls.push(args);throw new ExecutionUncertainError(code);});
+  await assert.rejects(backend.runTurn('ses_test123','question',new AbortController().signal),error=>error instanceof BackendFailureError&&error.code==='session_preflight_unavailable');
+  assert.ok(!calls.some(args=>args[0]==='exec'||args[1]==='queue'));
+ }finally{f.cleanup();}
+});
+
+test('a malformed or mismatched preflight transcript remains uncertain and never submits',async()=>{
+ for(const response of ['malformed',frame({missingSession:'ses_other123'})]){
   const f=fixture(),calls:string[][]=[];
   try{
    await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123','a'.repeat(48));
-   const backend=new AsideBackend(f,async args=>{calls.push(args);if(unavailable)throw new ExecutionUncertainError('cli_execution_unknown');return frame({missingSession:'ses_other123'});});
+   const backend=new AsideBackend(f,async args=>{calls.push(args);return response;});
    await assert.rejects(backend.runTurn('ses_test123','question',new AbortController().signal),e=>e instanceof ExecutionUncertainError);
    assert.ok(!calls.some(args=>args[0]==='exec'||args[1]==='queue'));
   }finally{f.cleanup();}
@@ -87,6 +98,57 @@ test('wrong CLI version and failed connection never launch a session',async()=>{
  const calls:string[][]=[];const backend=new AsideBackend(f,async args=>{calls.push(args);if(args[0]==='--version')return bad==='version'?'wrong':CLI_VERSION;throw Error('offline');});
  await assert.rejects(backend.createSession());assert.ok(!calls.some(x=>x[0]==='exec'));}}
  finally {f.cleanup();}
+});
+
+test('CLI transport loss before session creation is a known unsubmitted failure',async()=>{
+ for(const failAt of [1,2,3]){
+  const f=fixture(),calls:string[][]=[];let reads=0;
+  try{
+   const backend=new AsideBackend(f,async args=>{calls.push(args);if(++reads===failAt)throw new ExecutionUncertainError('cli_execution_unknown');return args[0]==='--version'?CLI_VERSION:'No sessions.';});
+   await assert.rejects(backend.createSession(),e=>e instanceof BackendFailureError&&e.code==='session_preflight_unavailable');
+   assert.ok(!calls.some(args=>args[0]==='exec'||args[1]==='queue'));
+  }finally{f.cleanup();}
+ }
+});
+
+test('connection loss during Aside preflight never submits the question',async()=>{
+ const f=fixture(),marker='a'.repeat(48);let connected=true,queued=0;
+ try{
+  await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123',marker);
+  const backend=new AsideBackend(f,async args=>{
+   if(args[0]==='--version')return CLI_VERSION;
+   if(args[1]==='list')return 'ses_test123  idle  ephemeral  title';
+   if(args[1]==='queue'){queued++;return 'ok';}
+   if(args.at(-1)!.includes("order:'asc'"))return frame([{role:'user',content:bootstrapPrompt(marker)},assistant(`READY:${marker}`,'boot')]);
+   connected=false;return frame(turnRows('boot',`READY:${marker}`,'boot'));
+  });
+  await assert.rejects(backend.runTurn('ses_test123','question',new AbortController().signal,undefined,undefined,()=>connected),e=>e instanceof BackendFailureError&&e.code==='transport_disconnected');
+  assert.equal(queued,0);
+ }finally{f.cleanup();}
+});
+
+test('lost creation response adopts only its completed bootstrap without creating again',async()=>{
+ const f=fixture();let marker='',prompt='',creates=0;
+ const backend=new AsideBackend(f,async args=>{
+  if(args[0]==='--version')return CLI_VERSION;
+  if(args[1]==='list')return creates?'ses_recovered  idle  ephemeral  Bootstrap':'No sessions.';
+  if(args[0]==='exec'){creates++;prompt=args.at(-1)!;marker=prompt.match(/READY:([a-f0-9]{48})/)![1]!;throw Error('response lost');}
+  return frame([{role:'user',content:prompt},assistant(`READY:${marker}`,'boot')]);
+ });
+ try{assert.equal(await backend.createSession(),'ses_recovered');assert.equal(creates,1);assert.equal(await new SessionRegistry(f.registryPath,f.registryKeyPath).find('ses_recovered'),marker);}finally{f.cleanup();}
+});
+
+test('successful creation whose session has vanished fails safely; lost responses stay uncertain',async()=>{
+ for(const lost of [false,true])for(const missing of [false,true]){
+  const f=fixture();let created=false;
+  const backend=new AsideBackend(f,async args=>{
+   if(args[0]==='--version')return CLI_VERSION;
+   if(args[1]==='list')return created&&missing?'ses_vanished  idle  ephemeral  Bootstrap':'No sessions.';
+   if(args[0]==='exec'){created=true;if(lost)throw Error('unknown');return '';}
+   return frame({missingSession:'ses_vanished'});
+  });
+  try{await assert.rejects(backend.createSession(),lost?ExecutionUncertainError:(e:unknown)=>e instanceof BackendFailureError&&e.code==='session_creation_unavailable');}finally{f.cleanup();}
+ }
 });
 
 test('CLI args keep prompt as one literal token; new session is bound by bootstrap marker', async () => {
@@ -168,6 +230,53 @@ test('new selections reach creation args, survive registry adoption and reject a
  }
 });
 
+test('preset switches update only an owned idle session model before queueing, including switching back',async()=>{
+ const f=fixture(),marker='a'.repeat(48);
+ const original:ModelSelection={provider:'openai-codex',modelId:'gpt-6-luna',thinkingLevel:'max',fastMode:true};
+ const deep:ModelSelection={provider:'openai-codex',modelId:'gpt-6-sol',thinkingLevel:'xhigh'};
+ try{
+  await new SessionRegistry(f.registryPath,f.registryKeyPath).add('ses_test123',marker);
+  let submitted=false,mode='ok',queued=0;const patches:unknown[]=[];
+  let selected:ModelSelection=original;
+  const backend=new AsideBackend(f,async args=>{
+   if(args[0]==='--version')return CLI_VERSION;
+   if(args[1]==='list')return 'ses_test123  idle  ephemeral  title';
+   if(args[1]==='queue'){submitted=true;queued++;return 'ok';}
+   const code=args.at(-1)!;
+   if(code.includes("order:'asc'"))return frame([{role:'user',content:bootstrapPrompt(marker)},assistant(`READY:${mode==='ownership'?'b'.repeat(48):marker}`,'boot')]);
+   if(code.includes('sessions.update')){
+    const output:string[]=[];
+    await runInNewContext(`(async()=>{${code}})()`,{aside:{sessions:{
+     get:()=>({id:'ses_test123',status:mode==='busy'?'running':'idle'}),
+     update:(id:string,patch:{model:ModelSelection})=>{
+      assert.equal(id,'ses_test123');patches.push(JSON.parse(JSON.stringify(patch)));
+      if(mode==='failure')throw Error('transport lost');
+      selected=patch.model;
+      return {id:mode==='wrong-id'?'ses_other':'ses_test123',status:'idle'};
+     },
+    }},console:{log:(s:string)=>output.push(s)}});
+    return output.join('\n');
+   }
+   return frame(submitted?turnRows('new','Answer','resp').map(value=>{const row=value as Record<string,unknown>;return row.role==='assistant'?{...row,model:mode==='wrong-model'?'gpt-5.6-sol':selected.modelId}:row;}):turnRows('boot',`READY:${marker}`,'boot'));
+  });
+  for(const selection of [deep,original]){
+   submitted=false;
+   const result=await backend.runTurn('ses_test123','Question',new AbortController().signal,selection,{bootstrapSelection:original});
+   assert.equal(result.model,`${selection.provider}/${selection.modelId}`);
+   assert.deepEqual(patches.at(-1),{model:{...selection,fastMode:selection.fastMode??false}});
+  }
+  assert.equal(queued,2);
+  for(mode of ['busy','failure','wrong-id','ownership']){
+   submitted=false;const priorPatches=patches.length;
+   await assert.rejects(backend.runTurn('ses_test123','Question',new AbortController().signal,deep,{bootstrapSelection:original}));
+   assert.equal(queued,2);
+   if(mode==='busy'||mode==='ownership')assert.equal(patches.length,priorPatches);
+  }
+  mode='wrong-model';submitted=false;
+  await assert.rejects(backend.runTurn('ses_test123','Question',new AbortController().signal,deep,{bootstrapSelection:original}),ExecutionUncertainError);
+ }finally{f.cleanup();}
+});
+
 test('only completed fresh final-answer text is released, with real tool-result sources', () => {
   const before = new Set(['turn_old', 'resp_old']);
   const source = [{ role: 'toolResult', toolName: 'websearch', toolCallId: 'call1', isError: false, details: { sources: [{ title: 'Source', url: 'https://example.org/path' }] } }];
@@ -175,7 +284,7 @@ test('only completed fresh final-answer text is released, with real tool-result 
   assert.throws(() => finalAnswer([assistant('No lifecycle', 'resp_new')], new Set()), ExecutionUncertainError);
   assert.throws(() => finalAnswer(turnRows('turn_new', 'x', 'resp_new').map(x => (x as Record<string, unknown>).role === 'assistant' ? { ...(x as object), model: 'gpt-6-astra' } : x), new Set()), ExecutionUncertainError);
   assert.throws(() => finalAnswer(turnRows('turn_new', 'x', 'resp_new').map(x => (x as Record<string, unknown>).role === 'assistant' ? { ...(x as object), content: [{ type: 'text', text: 'x' }] } : x), new Set()), ExecutionUncertainError);
-  assert.throws(() => finalAnswer(turnRows('turn_new', 'x', 'resp_new', [{ ...source[0], details: { sources: [{ title: 'bad', url: 'file:///etc/passwd' }] } }]), new Set()), ExecutionUncertainError);
+  assert.equal(finalAnswer(turnRows('turn_new', 'x', 'resp_new', [{ ...source[0], details: { sources: [{ title: 'bad', url: 'file:///etc/passwd' }] } }]), new Set()), 'x');
   assert.throws(() => parseReplJson('unmarked stdout'), ExecutionUncertainError);
 });
 
@@ -187,7 +296,7 @@ test('more than 20 valid search sources limit appended links without rejecting t
   const answer = finalAnswer(turnRows('turn_new', 'Answer', 'resp_new', searches), new Set());
   assert.equal(answer, 'Answer\n\nSources:\n' + searches.flatMap(s => s.details.sources).slice(0, 20).map(s => `- ${s.title}: ${s.url}`).join('\n'));
   searches[2]!.details.sources[9]!.url = 'file:///etc/passwd';
-  assert.throws(() => finalAnswer(turnRows('turn_new', 'Answer', 'resp_new', searches), new Set()), ExecutionUncertainError);
+  assert.equal(finalAnswer(turnRows('turn_new', 'Answer', 'resp_new', searches), new Set()), answer);
 });
 
 test('stop never claims confirmation from CLI exit alone', async () => {
@@ -365,4 +474,32 @@ test('CLI shutdown waits for owned children and forbids later spawns',async()=>{
  await new Promise(r=>setTimeout(r,100));await shutdownAsideCliChildren();await settled;
  await assert.rejects(runAsideCli(process.execPath,['-e','process.exit(0)'],1000));`;
  await promisify(execFile)(process.execPath,['--input-type=module','-e',code],{timeout:5000});
+});
+
+
+test('long search source titles preserve the verified answer and a bounded Unicode-safe display title',()=>{
+ for(const title of ['A'.repeat(190),'A'.repeat(179)+'😀tail']){
+  const source={role:'toolResult',toolName:'websearch',isError:false,details:{sources:[{title,url:'https://example.org/source'}]}};
+  const answer=finalAnswer(turnRows('new','Answer','resp',[source]),new Set());
+  assert.match(answer,/^Answer\n\nSources:/);
+  const shown=answer.split('\n- ')[1]!.split(': https:')[0]!;
+  assert.ok(shown.length<=180);assert.ok(!/[\uD800-\uDBFF]$/.test(shown));
+ }
+});
+
+test('unsafe sources do not suppress a verified answer, but incomplete turns remain uncertain',()=>{
+ const source={role:'toolResult',toolName:'websearch',isError:false,details:{sources:[{title:'bad',url:'file:///private'}]}};
+ assert.equal(finalAnswer(turnRows('new','Answer','resp',[source]),new Set()),'Answer');
+ const incomplete=turnRows('new','Answer','resp',[source]).filter(m=>!(m&&typeof m==='object'&&'event' in m&&m.event==='finished'));
+ assert.throws(()=>finalAnswer(incomplete,new Set()),ExecutionUncertainError);
+});
+
+test('malformed search sources are skipped individually while valid links and the answer survive',()=>{
+ const valid={id:'valid',title:'Valid',url:'https://example.org/source'};
+ const invalid=[null,{}, {title:42,url:valid.url},{title:'Bad',url:42},
+  ...['not a URL','file:///private','javascript:alert(1)','https://search-fragment@cdc.gov/path','https://user:password@example.org/path'].map(url=>({title:'Bad',url}))];
+ const search=(sources:unknown)=>({role:'toolResult',toolName:'websearch',isError:false,details:{sources}});
+ assert.equal(finalAnswer(turnRows('new','Answer','resp',[search([valid,...invalid,{title:'Second',url:'http://example.org/second'}]),search(null),search({}),search(undefined)]),new Set()),
+  'Answer\n\nSources:\n- Valid: https://example.org/source\n- Second: http://example.org/second');
+ assert.equal(finalAnswer(turnRows('new','Answer','resp',[search(invalid)]),new Set()),'Answer');
 });

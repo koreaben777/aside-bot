@@ -36,3 +36,10 @@ export class AsideSettings {
     this.edits=edit;return edit;
   }
 }
+
+/** Fixed user-facing messages; never expose raw CLI/account diagnostics. */
+export function presetReadFailureMessage(error:unknown):string {
+  if(error instanceof Error&&'code' in error&&error.code==='aside_profile_window_closed')return 'Aside u0 프로필의 브라우저 창이 닫혀 있어 프리셋을 읽지 못했습니다. 해당 프로필 창을 열고 다시 질문해 주세요. 이 질문은 접수하거나 실행하지 않았습니다.';
+  if(error instanceof Error&&['invalid_shared_presets','invalid_model_selection'].includes(error.message))return 'Aside 공유 프리셋의 모델·추론 설정을 확인해 주세요. 지원하지 않는 값이 있어 이 질문을 접수하지 않았습니다.';
+  return 'Aside 프리셋을 확인하지 못했습니다. Mac에서 Aside 연결을 확인한 뒤 다시 질문해 주세요. 이 질문은 접수하지 않았습니다.';
+}

@@ -1,10 +1,11 @@
+import {presetReadFailureMessage} from '../aside/settings.js';
 import {Engine} from '../core/engine.js';
 import {Store} from '../store.js';
-import {PRESET_NAMES,PRESET_LABELS,type BotConfig,type Outbound} from '../types.js';
+import {DeliveryFailure,PRESET_NAMES,PRESET_LABELS,type BotConfig,type Outbound} from '../types.js';
 import {formatSlackAnswer,slackAnswerPart} from './presentation.js';
 
 export interface SlackResponse {
-  ok?:boolean;team_id?:string;bot_id?:string;user_id?:string;ts?:string;
+  error?:string;ok?:boolean;team_id?:string;bot_id?:string;user_id?:string;ts?:string;
   bot?:{app_id?:string};channel?:{id?:string;is_im?:boolean;user?:string;is_mpim?:boolean;is_channel?:boolean;is_group?:boolean;is_member?:boolean;is_archived?:boolean;context_team_id?:string};
   messages?:unknown[];has_more?:boolean;response_metadata?:{next_cursor?:string};
 }
@@ -23,7 +24,7 @@ async function assertChannel(api:SlackApi,channel:string,team:string):Promise<vo
 }
 const escape=(text:string)=>text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 const decode=(text:string)=>text.replaceAll('&lt;','<').replaceAll('&gt;','>').replaceAll('&amp;','&');
-const help='DM에 질문을 보내면 새 대화가 시작됩니다. 같은 메시지의 스레드에 답글을 보내면 이어집니다.\n채널에서는 질문과 명령마다 @Aside를 명시적으로 호출하세요. 스레드 자동 응답은 기본 꺼짐입니다. channelThreadAutoReply를 켠 경우에만 연결된 스레드의 소유자 댓글과 명령에 멘션이 필요 없습니다. 자동 응답에서 다른 사용자를 직접 멘션한 댓글은 받지 않습니다. 기존 스레드의 첫 호출은 이전 메시지를 일부 조회하며 조회 실패 시 접수하지 않습니다.\n!aside read recent 질문 · !aside read thread 타임스탬프 질문: 직접 멘션과 함께 같은 채널의 일부 메시지를 명시적으로 조회합니다.\n!aside status · !aside settings · !aside preset fast|standard|deep · !aside help\n중단하려는 스레드에서 !aside stop을 보내세요. 첨부파일은 아직 지원하지 않습니다.';
+const help='DM에 질문을 보내면 새 대화가 시작됩니다. 같은 메시지의 스레드에 답글을 보내면 이어집니다.\n채널에서는 질문과 명령마다 @Aside를 명시적으로 호출하세요. 스레드 자동 응답은 기본 꺼짐입니다. channelThreadAutoReply를 켠 경우에만 연결된 스레드의 소유자 댓글과 명령에 멘션이 필요 없습니다. 자동 응답에서 다른 사용자를 직접 멘션한 댓글은 받지 않습니다. 기존 스레드의 첫 호출은 이전 메시지를 일부 조회하며 조회 실패 시 접수하지 않습니다.\n!aside read recent 질문 · !aside read thread 타임스탬프 질문: 직접 멘션과 함께 같은 채널의 일부 메시지를 명시적으로 조회합니다.\n!aside status · !aside settings · !aside preset fast|standard|deep · !aside help\n프리셋은 대화 스레드 안에서 현재 대화의 다음 질문부터, 밖에서는 새 대화 기본값으로 적용합니다. 실행·대기 중에는 대화 프리셋을 바꿀 수 없습니다.\n중단하려는 스레드에서 !aside stop을 보내세요. 첨부파일은 아직 지원하지 않습니다.';
 
 const before=(a:string,b:string)=>BigInt(a.replace('.',''))<BigInt(b.replace('.',''));
 const clip=(text:string,limit:number)=>{
@@ -38,10 +39,19 @@ export function createSlackApi(token:string,request:typeof fetch=fetch):SlackApi
     if(!/^[a-z]+\.[a-zA-Z]+$/.test(method))throw new Error('invalid_slack_method');
     const read=['bots.info','conversations.info','conversations.history','conversations.replies'].includes(method),url=new URL('https://slack.com/api/'+method);
     if(read)for(const [key,value] of Object.entries(body))url.searchParams.set(key,String(value));
-    const response=await request(url,{method:read?'GET':'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:read?undefined:JSON.stringify(body),signal:AbortSignal.timeout(30_000)});
-    if(!response.ok)throw new Error('slack_http_failed');
-    const result=await response.json() as SlackResponse;
-    if(result?.ok!==true)throw new Error('slack_api_failed');
+    let response:Response;
+    try {response=await request(url,{method:read?'GET':'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:read?undefined:JSON.stringify(body),signal:AbortSignal.timeout(30_000)});}
+    catch(error){throw new DeliveryFailure('unknown','post',error instanceof Error&&error.name==='TimeoutError'?'timeout':error instanceof Error&&error.name==='AbortError'?'aborted':'transport_unknown');}
+    if(!response.ok)throw new DeliveryFailure('unknown','post','slack_http_failed',response.status);
+    let result:SlackResponse;
+    try{result=await response.json() as SlackResponse;}catch{throw new DeliveryFailure('unknown','post','invalid_response',response.status);}
+    if(result?.ok!==true){
+      // Explicit documented rejection only. internal_error/fatal_error and unknown
+      // responses can follow partial processing and must never be retried.
+      const rejected=new Set(['invalid_blocks','invalid_blocks_format','msg_too_long','no_text','invalid_auth','not_authed','token_revoked','account_inactive','missing_scope','channel_not_found','not_in_channel','is_archived','restricted_action','thread_not_found']);
+      const definite=typeof result?.error==='string'&&rejected.has(result.error);
+      throw new DeliveryFailure(definite?'not_sent':'unknown','post',definite?result.error!:'slack_api_failed',response.status);
+    }
     return result;
   };
 }
@@ -63,15 +73,16 @@ export async function connectOwnerDm(api:SlackApi,config:BotConfig&{applicationI
   return dm.channel.id;
 }
 
-async function post(api:SlackApi,channel:string,ts:string,text:string,context?:string):Promise<string> {
+async function post(api:SlackApi,channel:string,ts:string,text:string,context?:string,markdown?:string):Promise<string> {
   const result=await api('chat.postMessage',{channel,thread_ts:ts,text:escape(text),
-    blocks:[{type:'section',text:{type:'plain_text',text,emoji:false}},...(context?[{type:'context',elements:[{type:'mrkdwn',text:context,verbatim:true}]}]:[])],
+    blocks:[markdown?{type:'markdown',text:markdown}:{type:'section',text:{type:'plain_text',text,emoji:false}},...(context?[{type:'divider'},{type:'header',text:{type:'plain_text',text:'출처',emoji:false}},{type:'section',text:{type:'mrkdwn',text:context,verbatim:true}}]:[])],
     mrkdwn:false,parse:'none',unfurl_links:false,unfurl_media:false});
-  if(!result.ts||!timestamp.test(result.ts))throw new Error('slack_delivery_unknown');
+  if(!result.ts||!timestamp.test(result.ts))throw new DeliveryFailure('unknown','receipt','slack_delivery_unknown');
   return result.ts;
 }
 export function createSlackOutbound(api:SlackApi,config:BotConfig,store:Store,channelMentions=false,stopping:()=>boolean=()=>false):Outbound {
-  return {retrySafe:false,progressNotices:false,formatAnswer:formatSlackAnswer,async send(threadId,content,nonce,answerRequestId,_replyToMessageId,progressRequestId){
+  return {retrySafe:false,progressNotices:false,formatAnswer:formatSlackAnswer,async send(threadId,content,nonce,answerRequestId,_replyToMessageId,progressRequestId,accepted){
+    const prepared=await (async()=>{try {
     if(stopping())throw Error('service_stopping');
     const bound=store.session(threadId),[channel,ts,...rest]=threadId.split(':');
     if(!bound||bound.guildId!==config.guildId||bound.ownerUserId!==config.ownerUserId||bound.parentChannelId!==channel||!allowedSlackParent(config,channel!,channelMentions)||!ts||!timestamp.test(ts)||rest.length)throw new Error('invalid_slack_destination');
@@ -83,7 +94,12 @@ export function createSlackOutbound(api:SlackApi,config:BotConfig,store:Store,ch
     const part=store.db.prepare("SELECT o.content,r.state FROM outbox o JOIN requests r ON r.id=o.request_id WHERE o.nonce=? AND o.thread_id=? AND o.kind='answer'").get(nonce,threadId) as {content:string;state:string}|undefined;
     const rendered=part&&part.state==='completed'&&part.content===content?slackAnswerPart(content):undefined;
     if(stopping())throw Error('service_stopping');
-    const sent=await post(api,channel,ts,rendered?.body??content,rendered?.context);
+    return {channel:channel!,ts,rendered,request};
+    }catch(error){throw new DeliveryFailure('not_sent','prepare',error instanceof DeliveryFailure?error.code:error instanceof Error&&['service_stopping','invalid_slack_destination','slack_channel_access_denied','invalid_slack_answer','invalid_slack_progress','invalid_slack_answer_part','invalid_slack_reference','invalid_slack_reference_length'].includes(error.message)?error.message:'preflight_failed',error instanceof DeliveryFailure?error.httpStatus:null);}})();
+    const {channel,ts,rendered,request}=prepared;
+    if(stopping())throw new DeliveryFailure('not_sent','prepare','service_stopping');
+    const sent=await post(api,channel,ts,rendered?.body??content,rendered?.context,rendered?.markdown);
+    accepted?.(sent); // Persist before any optional cleanup can wait or fail.
     const removeNotice=async(notice:ReturnType<Store['outputParts']>[number])=>{
       const messageId=notice.discordMessageId; // Shared outbox field stores Slack message timestamps.
       if(notice.threadId!==threadId||notice.state!=='sent'||!messageId||!timestamp.test(messageId)||messageId===sent)return;
@@ -149,7 +165,9 @@ export class SlackBot {
       const bound=this.engine.store.session(threadId);
       if(!bound){
         if(dm&&e.thread_ts!==undefined){await reply('이 스레드는 관리 중인 Aside 대화가 아닙니다. DM에 새 질문을 보내 주세요.');return;}
-        if(this.engine.store.hasUncertain()||this.engine.store.pendingCount()>=5){await reply('실행 상태가 불명확하거나 대기열이 가득 찼습니다. !aside status로 확인해 주세요.');return;}
+        this.engine.maintainQueue();
+        if(this.engine.store.hasGlobalUncertainty()){await reply(this.engine.store.globalBlockMessage()!);return;}
+        if(this.engine.store.pendingCount()>=5){await reply('대기 중인 요청이 5개로 가득 찼습니다. 잠시 후 직접 다시 질문해 주세요.');return;}
         if(channelMention&&e.thread_ts!==undefined&&!command){
           try{text=await this.firstThreadContext(text,channel,root,e.ts);}
           catch{await reply('이 스레드의 이전 맥락을 조회하지 못해 질문을 접수하지 않았습니다. 앱의 스레드 읽기 권한과 연결을 확인해 주세요. 질문과 참고 자료는 합계 8,000자 이내여야 합니다.');return;}
@@ -158,7 +176,7 @@ export class SlackBot {
         const name=this.engine.store.defaultPreset();
         let selection;
         try{selection=await this.engine.settings.readPreset(name);}
-        catch{await reply('Aside 프리셋을 확인하지 못했습니다. Mac에서 Aside 연결을 확인한 뒤 다시 질문해 주세요.');return;}
+        catch(error){await reply(presetReadFailureMessage(error));return;}
         // Another first mention may have registered this thread while settings were awaited.
         if(this.engine.stopping)return;
         if(!this.engine.store.session(threadId))this.engine.store.bindThread({threadId,guildId:c.guildId,parentChannelId:channel,ownerUserId:c.ownerUserId},sourceId,{presetName:name,selection});
@@ -166,7 +184,7 @@ export class SlackBot {
       // Translate the verified owner request into the engine's logical thread binding.
       const result=this.engine.submit({sourceId,userId:c.ownerUserId,guildId:c.guildId,channelId:threadId,content:text},
         {inputKind:e.thread_ts===undefined?'initial':'message',publishQueueNotice:true});
-      if(result.kind==='rejected')await reply(`질문을 접수하지 못했습니다 (${result.reason}). !aside status로 확인해 주세요.`);
+      if(result.kind==='rejected')await reply(result.reason==='blocked'?'이 스레드가 격리됐거나 원격 실행 확인이 필요합니다. !aside status로 확인해 주세요. 자동 재전송하지 않습니다.':result.reason==='queue_full'?'대기 중인 요청이 5개로 가득 찼습니다. 잠시 후 직접 다시 질문해 주세요.':`질문을 접수하지 못했습니다 (${result.reason}). !aside status로 확인해 주세요.`);
     }finally{this.inFlight.delete(sourceId);}
   }
   private async firstThreadContext(question:string,channel:string,root:string,latest:string):Promise<string>{
@@ -221,12 +239,25 @@ export class SlackBot {
     const [,name,arg,...rest]=text.trim().split(/\s+/),store=this.engine.store;
     if(name==='preset'&&PRESET_NAMES.includes(arg as typeof PRESET_NAMES[number])&&!rest.length){
       const preset=arg as typeof PRESET_NAMES[number];
-      await this.engine.settings?.readPreset(preset);store.setDefaultPreset(preset);
+      if(inThread&&!store.session(threadId)){await reply('이 스레드는 관리 중인 Aside 대화가 아닙니다. 새 대화 기본값은 스레드 밖에서 변경하세요.');return;}
+      const busy='실행·대기 중이거나 실행 상태 확인이 필요한 대화는 프리셋을 변경할 수 없습니다. 완료 후 다시 시도하세요.';
+      if(inThread&&(store.busyInThread(threadId)||store.session(threadId)?.blocked||store.counts(threadId).uncertain||store.hasGlobalUncertainty())){await reply(busy);return;}
+      let selection;
+      try{
+        if(!this.engine.settings)throw new Error('slack_settings_unavailable');
+        selection=await this.engine.settings.readPreset(preset);
+      }catch{await reply('프리셋을 읽지 못해 설정을 변경하지 않았습니다. Aside 연결과 프리셋 설정을 확인하세요.');return;}
+      if(this.engine.stopping)return;
+      if(inThread){
+        if(!store.setThreadPreset(threadId,preset,selection)){await reply(busy);return;}
+        await reply(`이 대화 프리셋: ${PRESET_LABELS[preset]} · ${selection.modelId} · 추론 지정값 ${selection.thinkingLevel}. 대화 기록을 유지하며 다음 질문부터 적용합니다.`);return;
+      }
+      store.setDefaultPreset(preset);
       await reply(`새 대화 기본값: ${PRESET_LABELS[preset]}. 기존 대화 설정은 유지합니다.`);return;
     }
     if(name==='status'&&!arg){
       const s=this.engine.status(inThread?threadId:undefined);
-      await reply(`대기 ${s.queued} · 실행 ${s.running} · 실행 불명확 ${s.uncertain} · 전송 불명확 ${s.deliveryUncertain}${s.blocked?' · 차단됨':''}`);return;
+      await reply(`대기 ${s.queued} · 실행 ${s.running} · 실행 불명확 ${s.uncertain} · 전송 불명확 ${s.deliveryUncertain} · 전송 실패 ${s.deliveryFailed}${s.blocked?' · 차단됨':''}`);return;
     }
     if(name==='settings'&&!arg){
       const presets=await this.engine.settings?.readPresets(),bound=store.session(threadId);

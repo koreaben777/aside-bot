@@ -219,9 +219,12 @@ async function handleCommand(interaction:ChatInputCommandInteraction,engine:Engi
       await interaction.reply({content:'1자 이상 8000자 이하의 텍스트 질문을 입력해 주세요.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});
       return;
     }
-    if(engine.store.hasUncertain() || engine.store.pendingCount()>=5) {
-      await interaction.reply({content:'안전을 위해 실행이 중단되었거나 대기열이 가득 찼습니다. 잠시 후 확인해 주세요.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});
-      return;
+    engine.maintainQueue();
+    if(engine.store.hasGlobalUncertainty()) {
+      await interaction.reply({content:engine.store.globalBlockMessage()!,flags:MessageFlags.Ephemeral,allowedMentions:noMentions});return;
+    }
+    if(engine.store.pendingCount()>=5) {
+      await interaction.reply({content:'대기 중인 요청이 5개로 가득 찼습니다. 잠시 후 다시 시도해 주세요.',flags:MessageFlags.Ephemeral,allowedMentions:noMentions});return;
     }
     await interaction.deferReply({flags:MessageFlags.Ephemeral});
     const existing=engine.store.sessionByOrigin(interaction.id);
@@ -245,7 +248,9 @@ async function startConversation(interaction:ChatInputCommandInteraction|StringS
   if(engine.stopping)return;
   const config=engine.config,existing=engine.store.sessionByOrigin(interaction.id);
   if(existing){await interaction.editReply({content:`이미 생성한 스레드: <#${existing.threadId}>`,allowedMentions:noMentions});return;}
-  if(engine.store.hasUncertain()||engine.store.pendingCount()>=5){await interaction.editReply({content:'실행 상태가 불확실하거나 대기열이 가득 차 새 대화를 시작하지 못했습니다.',allowedMentions:noMentions});return;}
+  engine.maintainQueue();
+  if(engine.store.hasGlobalUncertainty()){await interaction.editReply({content:engine.store.globalBlockMessage()!,allowedMentions:noMentions});return;}
+  if(engine.store.pendingCount()>=5){await interaction.editReply({content:'대기 중인 요청이 5개로 가득 찼습니다. 잠시 후 다시 시도해 주세요.',allowedMentions:noMentions});return;}
   const destination=await interaction.client.channels.fetch(config.channelId);
   if(!destination||destination.type!==ChannelType.GuildText||destination.guildId!==config.guildId)throw new Error('invalid configured channel');
   if(engine.stopping)return;

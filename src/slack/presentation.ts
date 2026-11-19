@@ -1,5 +1,6 @@
 import type {AnswerSource,BackendAnswer} from '../types.js';
-import {splitOutput} from '../core/split.js';
+import {splitSlackMarkdown} from './split.js';
+import {slackVisualFallback} from './visual.js';
 
 interface Reference {number:number;title:string;url:string}
 interface AnswerPart {type:'slack_answer';body:string;references:Reference[]}
@@ -9,19 +10,19 @@ function sourceUrl(value:string):string|undefined {
   try{const u=new URL(value);if(!['https:','http:'].includes(u.protocol)||!u.hostname||u.username||u.password)return;return u.href;}catch{return;}
 }
 function label(title:string):string {
-  return Array.from(title.replace(/[<>|`*_~\r\n\u0000-\u001f]/g,' ').replace(/\s+/g,' ').trim()).slice(0,60).join('')||'출처';
+  return Array.from(title.replace(/[<>|`*_~\r\n\u0000-\u001f]/g,' ').replace(/\s+/g,' ').trim()).slice(0,60).join('').trimEnd()||'출처';
 }
 function context(references:Reference[]):string {
-  return references.map(r=>`<${escape(r.url)}|[${r.number}] ${escape(r.title)}>`).join(' · ');
+  return references.map(r=>`<${escape(r.url)}|[${r.number}] ${escape(r.title)}>`).join('\n');
 }
 
 /** Process citation markup in prose only; code and unrelated HTML/entities/URLs are literal. */
-function proseOnly(text:string,transform:(prose:string)=>string):string {
+function proseOnly(text:string,transform:(prose:string,start:number)=>string):string {
   let at=0,result='';const runs=/`+|~{3,}/g;
   while(at<text.length){
     runs.lastIndex=at;const run=runs.exec(text);
-    if(!run){result+=transform(text.slice(at));break;}
-    result+=transform(text.slice(at,run.index));
+    if(!run){result+=transform(text.slice(at),at);break;}
+    result+=transform(text.slice(at,run.index),at);
     const end=text.indexOf(run[0],run.index+run[0].length);
     // Conservatively keep an unclosed code span/fence unchanged through EOF.
     if(end<0){result+=text.slice(run.index);break;}
@@ -38,7 +39,7 @@ export function formatSlackAnswer(answer:BackendAnswer,elapsed:string):string[] 
     if(sources.has(source.id)&&sources.get(source.id)!.url!==url)ambiguous.add(source.id);
     sources.set(source.id,{...source,url});
   }
-  const references:Reference[]=[],byUrl=new Map<string,number>(),stack:string[][]=[];
+  const references:Reference[]=[],byUrl=new Map<string,number>(),stack:Array<{ids:string[];detached:boolean}>=[];
   const cite=(ids:string[])=>{
     const numbers:number[]=[];
     for(const id of ids){
@@ -55,25 +56,50 @@ export function formatSlackAnswer(answer:BackendAnswer,elapsed:string):string[] 
     }
     return numbers.length?'['+numbers.join(', ')+']':'';
   };
-  const body=proseOnly(answer.sourceText??answer.text,prose=>prose.replace(/(?:<|&lt;|&amp;lt;)(\/?)citation(?=[\s>]|&(?:amp;)?gt;)([^<>\r\n]{0,1024}?)(?:>|&gt;|&amp;gt;)/g,(_tag,closing:string,attributes:string)=>{
-    if(closing)return cite(stack.pop()??[]);
-    const decoded=attributes.replaceAll('&amp;quot;','"').replaceAll('&quot;','"').replaceAll('&#34;','"').replaceAll('&amp;apos;',"'").replaceAll('&apos;',"'").replaceAll('&#39;',"'");
-    const refs=/\brefs\s*=\s*["']([^"']*)["']/.exec(decoded)?.[1]??'';
-    stack.push(refs.split(/[,\s]+/).flatMap(ref=>{const id=/^([-A-Za-z0-9_]{1,128})(?:#\d+)?$/.exec(ref)?.[1];return id?[id]:[];}));
-    return '';
-  }));
-  const parts=splitOutput(`(${elapsed} 경과)\n\n${body||'(답변 내용이 없습니다.)'}`);
+  const sourceIds=(refs:string)=>refs.split(/[,\s\uE202]+/).flatMap(ref=>{const id=/^([-A-Za-z0-9_]{1,128})(?:#\d+)?$/.exec(ref)?.[1];return id?[id]:[];});
+  const original=slackVisualFallback(answer.sourceText??answer.text);
+  const body=proseOnly(original,(prose,start)=>{
+    const tags=[...prose.matchAll(/(?:<|&lt;|&amp;lt;)(\/?)citation(?=[\s>]|&(?:amp;)?gt;)([^<>\r\n]{0,1024}?)(?:>|&gt;|&amp;gt;)|\uE200cite\uE202([^\uE200\uE201\r\n]*)\uE201/g)];
+    const pairs=new Map<number,number>(),opens:number[]=[];
+    for(let i=0;i<tags.length;i++){
+      if(tags[i]![3]!==undefined)continue;
+      if(!tags[i]![1])opens.push(i);
+      else{const opening=opens.pop();if(opening!==undefined)pairs.set(opening,i);}
+    }
+    let result='',at=0;
+    for(let i=0;i<tags.length;i++){
+      const tag=tags[i]!;result+=prose.slice(at,tag.index);at=tag.index+tag[0].length;
+      if(tag[3]!==undefined){result+=cite(sourceIds(tag[3]));continue;}
+      if(tag[1]){
+        const frame=stack.pop(),marker=cite(frame?.ids??[]);
+        result+=(frame?.detached&&marker?' ':'')+marker;continue;
+      }
+      const closing=pairs.get(i),end=closing===undefined?undefined:tags[closing]!;
+      // Only move a paired, nonempty citation after a completed sentence at a paragraph end.
+      const detached=stack.length===0&&!!end&&/[.!?。][ \t]*$/.test(result)&&!!prose.slice(at,end.index).trim()
+        &&/^[ \t]*[.!?。]?[ \t]*(?:\r?\n[ \t]*\r?\n|\s*$)/.test(original.slice(start+end.index+end[0].length));
+      if(detached)result=result.trimEnd()+'\n\n근거: ';
+      const decoded=tag[2]!.replaceAll('&amp;quot;','"').replaceAll('&quot;','"').replaceAll('&#34;','"').replaceAll('&amp;apos;',"'").replaceAll('&apos;',"'").replaceAll('&#39;',"'");
+      const refs=/\brefs\s*=\s*["']([^"']*)["']/.exec(decoded)?.[1]??'';
+      const ids=sourceIds(refs);
+      stack.push({ids,detached});
+    }
+    return result+prose.slice(at);
+  });
+  const parts=splitSlackMarkdown(`(${elapsed} 경과)\n\n${body||'(답변 내용이 없습니다.)'}`);
   // Persist the rendered parts, so delivery after restart never reconstructs citations differently.
   return parts.map((body,i)=>JSON.stringify({type:'slack_answer',body,references:i===parts.length-1?references:[]} satisfies AnswerPart));
 }
 
 /** Called only for a completed answer part identified in the durable outbox. */
-export function slackAnswerPart(content:string):{body:string;context?:string}|undefined {
+export function slackAnswerPart(content:string):{body:string;markdown:string;context?:string}|undefined {
   let value:unknown;try{value=JSON.parse(content);}catch{return;}
   if(!value||typeof value!=='object'||(value as AnswerPart).type!=='slack_answer')return;
   const part=value as AnswerPart;
   if(typeof part.body!=='string'||!part.body||part.body.length>1900||!Array.isArray(part.references)||part.references.length>5)throw new Error('invalid_slack_answer_part');
   for(const ref of part.references)if(!ref||!Number.isInteger(ref.number)||ref.number<1||ref.number>5||typeof ref.title!=='string'||ref.title!==label(ref.title)||typeof ref.url!=='string'||!sourceUrl(ref.url))throw new Error('invalid_slack_reference');
   const links=context(part.references);if(links.length>1900)throw new Error('invalid_slack_reference_length');
-  return {body:part.body,...(links?{context:links}:{})};
+  // Native Slack control tokens are examples, not notifications. Code is already literal.
+  const markdown=proseOnly(part.body,prose=>prose.replace(/<[@#!][^<>\r\n`]+>/g,token=>'`'+token+'`'));
+  return {body:part.body,markdown,...(links?{context:links}:{})};
 }

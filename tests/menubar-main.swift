@@ -15,10 +15,11 @@ import Darwin
   assert(!sameProcess(original,reused))
   let myself=try inspectProcess(getpid());assert(myself?.pid==getpid());assert(myself?.uid==getuid());assert(myself?.workingDirectory==canonical(FileManager.default.currentDirectoryPath))
   let missing=try inspectProcess(Int32.max);assert(missing==nil)
-  assert(aggregate([.discord:BotViewState(phase:"connected"),.slack:BotViewState(phase:"connected")]) == .normal)
-  assert(aggregate([.discord:BotViewState(phase:"unknown"),.slack:BotViewState(phase:"connected")]) == .warning)
-  assert(aggregate([.discord:BotViewState(phase:"stopped"),.slack:BotViewState(phase:"stopped")]) == .stopped)
-  assert(aggregate([.discord:BotViewState(phase:"stopping"),.slack:BotViewState(phase:"connected")]) == .progress)
+  assert(aggregate([.discord:BotViewState(phase:"connected"),.slack:BotViewState(phase:"connected")],platforms:Platform.allCases) == .normal)
+  assert(aggregate([.discord:BotViewState(phase:"unknown"),.slack:BotViewState(phase:"connected")],platforms:Platform.allCases) == .warning)
+  assert(aggregate([.discord:BotViewState(phase:"stopped"),.slack:BotViewState(phase:"stopped")],platforms:Platform.allCases) == .stopped)
+  assert(aggregate([.discord:BotViewState(phase:"stopping"),.slack:BotViewState(phase:"connected")],platforms:Platform.allCases) == .progress)
+  assert(aggregate([.discord:BotViewState(phase:"stopped"),.slack:BotViewState(phase:"connected")]) == .normal, "disabled Discord must not make connected Slack unhealthy")
   assert(isStale(lastReply:10,now:16));assert(!isStale(lastReply:10,now:15.9))
   let suite="aside-menu-tests-\(UUID())";let defaults=UserDefaults(suiteName:suite)!;defer{defaults.removePersistentDomain(forName:suite)}
   let settings=MenuSettings(defaults);assert(!settings.autoStartBots && !settings.launchAtLoginRequested && settings.preventIdleSleep)
@@ -63,27 +64,27 @@ import Darwin
   setInterval(async()=>{if(existsSync('crash-slack')&&platform==='slack'){await unlink('crash-slack');process.exit(1);}},10);
   """
   for file in ["dist/src/main.js","dist/src/slack/main.js"]{try Data(script.utf8).write(to:project.appendingPathComponent(file))}
-  let c=BotController(projectURL:project,nodeURL:node,preventSleep:false,logDirectory:logs,discoverServices:{_ in []})
-  let first=Task{try await c.startBoth()};await Task.yield()
-  do{try await c.startBoth();assertionFailure("concurrent start must fail")}catch{}
-  try await first.value;await c.refresh();assert(aggregate(c.bots) == .normal)
+  let c=BotController(projectURL:project,nodeURL:node,preventSleep:false,platforms:Platform.allCases,logDirectory:logs,discoverServices:{_ in []})
+  let first=Task{try await c.startBots()};await Task.yield()
+  do{try await c.startBots();assertionFailure("concurrent start must fail")}catch{}
+  try await first.value;await c.refresh();assert(aggregate(c.bots,platforms:c.platforms) == .normal)
   do{_ = try ControlChannel(path:data.appendingPathComponent("control.sock").path,pid:getpid());assertionFailure("wrong peer PID accepted")}catch{}
   let ids=c.bots.values.compactMap{$0.snapshot?.instanceId};assert(ids.count==2)
   await c.setSleep(true);assert(c.bots.values.allSatisfy{$0.snapshot?.sleepActive==true});await c.setSleep(false)
-  c.invalidate();assert(c.bots.values.allSatisfy{$0.phase=="unknown"});await c.refresh();assert(aggregate(c.bots) == .normal)
-  try fm.removeItem(at:project.appendingPathComponent("config.local.json"));await c.refresh();assert(aggregate(c.bots) == .warning)
-  try config.write(to:project.appendingPathComponent("config.local.json"));await c.refresh();assert(aggregate(c.bots) == .normal)
-  try Data().write(to:project.appendingPathComponent("hold-stop"));let stop=Task{try await c.stopBoth()};try await Task.sleep(nanoseconds:100000000);assert(c.bots.values.allSatisfy{$0.phase=="stopping"})
-  try fm.removeItem(at:project.appendingPathComponent("hold-stop"));try await stop.value;assert(aggregate(c.bots) == .stopped)
+  c.invalidate();assert(c.bots.values.allSatisfy{$0.phase=="unknown"});await c.refresh();assert(aggregate(c.bots,platforms:c.platforms) == .normal)
+  try fm.removeItem(at:project.appendingPathComponent("config.local.json"));await c.refresh();assert(aggregate(c.bots,platforms:c.platforms) == .warning)
+  try config.write(to:project.appendingPathComponent("config.local.json"));await c.refresh();assert(aggregate(c.bots,platforms:c.platforms) == .normal)
+  try Data().write(to:project.appendingPathComponent("hold-stop"));let stop=Task{try await c.stopBots()};try await Task.sleep(nanoseconds:100000000);assert(c.bots.values.allSatisfy{$0.phase=="stopping"})
+  try fm.removeItem(at:project.appendingPathComponent("hold-stop"));try await stop.value;assert(aggregate(c.bots,platforms:c.platforms) == .stopped)
   // An old instance response is discarded and owner channel loss stops the children.
-  try await c.startBoth();try Data().write(to:project.appendingPathComponent("old-instance"));await c.refresh()
+  try await c.startBots();try Data().write(to:project.appendingPathComponent("old-instance"));await c.refresh()
   assert(c.bots.values.allSatisfy{$0.snapshot?.instanceId != "old-instance"})
   for _ in 0..<200{if c.bots.values.allSatisfy({$0.phase=="stopped"}){break};try await Task.sleep(nanoseconds:10000000)}
   assert(c.bots.values.allSatisfy{$0.phase=="stopped"});try fm.removeItem(at:project.appendingPathComponent("old-instance"))
   // Stopping during preparation must prevent late startup, even if stop initially has no child.
-  let late=Task{try await c.startBoth()};await Task.yield();try await c.stopBoth();do{try await late.value;assertionFailure("cancelled start succeeded")}catch{}
+  let late=Task{try await c.startBots()};await Task.yield();try await c.stopBots();do{try await late.value;assertionFailure("cancelled start succeeded")}catch{}
   assert(c.bots.values.allSatisfy{$0.ownership != "managed" || $0.phase=="stopped"})
-  try await c.startBoth()
+  try await c.startBots()
   await c.refresh()
   let previousPID=c.bots[.slack]?.snapshot?.pid
   let crash=project.appendingPathComponent("crash-slack")
@@ -100,11 +101,31 @@ import Darwin
   assert(c.bots.values.allSatisfy{$0.phase=="stopped"}, "a second exit must not restart the bot")
   // A live foreign PID in a service lock must block before preparation or spawn.
   try Data(String(getpid()).utf8).write(to:data.appendingPathComponent("service.lock"))
-  do{try await c.startBoth();assertionFailure("foreign lock accepted")}catch{}
+  do{try await c.startBots();assertionFailure("foreign lock accepted")}catch{}
   assert(c.bots.values.allSatisfy{$0.ownership != "managed"});try fm.removeItem(at:data.appendingPathComponent("service.lock"))
+  // Slack-only management ignores disabled Discord's entrypoint and lock.
+  try fm.removeItem(at:project.appendingPathComponent("dist/src/main.js"))
+  try Data(String(getpid()).utf8).write(to:data.appendingPathComponent("service.lock"))
+  let slack=BotController(projectURL:project,nodeURL:node,preventSleep:false,logDirectory:logs,discoverServices:{_ in []})
+  var lastInstance:String?
+  for _ in 0..<2 {
+   try await slack.startBots();await slack.refresh()
+   assert(slack.bots[.slack]?.phase=="connected" && slack.bots[.slack]?.ownership=="managed")
+   assert(aggregate(slack.bots) == .normal)
+   assert(slack.bots[.slack]?.snapshot?.instanceId != lastInstance)
+   lastInstance=slack.bots[.slack]?.snapshot?.instanceId
+   assert(!fm.fileExists(atPath:data.appendingPathComponent("control.sock").path))
+   let discordLock=try String(contentsOf:data.appendingPathComponent("service.lock"),encoding:.utf8);assert(discordLock==String(getpid()))
+   await slack.setSleep(true);assert(slack.bots[.slack]?.snapshot?.sleepActive==true)
+   try await slack.stopBots();await slack.refresh()
+   assert(slack.bots[.slack]?.phase=="stopped" && aggregate(slack.bots) == .stopped)
+   assert(!fm.fileExists(atPath:data.appendingPathComponent("slack/service.lock").path))
+  }
+  try fm.removeItem(at:data.appendingPathComponent("service.lock"))
+  try Data(script.utf8).write(to:project.appendingPathComponent("dist/src/main.js"))
   // Partial startup: the first child is cleaned when the second cannot expose control.
   try Data("process.exit(1);".utf8).write(to:project.appendingPathComponent("dist/src/slack/main.js"))
-  do{try await c.startBoth();assertionFailure("partial startup succeeded")}catch{}
+  do{try await c.startBots();assertionFailure("partial startup succeeded")}catch{}
   assert(!fm.fileExists(atPath:data.appendingPathComponent("service.lock").path))
  }
 
@@ -152,11 +173,11 @@ import Darwin
    func opened()->Bool{release != nil}
    func resume(){release?.resume(returning:[]);release=nil}
   }
-  let gate=Gate();let c=BotController(projectURL:project,nodeURL:node,preventSleep:false,logDirectory:root.appendingPathComponent("logs"),discoverServices:{_ in await gate.discover()})
+  let gate=Gate();let c=BotController(projectURL:project,nodeURL:node,preventSleep:false,platforms:Platform.allCases,logDirectory:root.appendingPathComponent("logs"),discoverServices:{_ in await gate.discover()})
   let takeover=Task{do{try await c.takeOver();return "completed"}catch{return (error as? ManagerError)?.code ?? "unknown"}}
   while !(await gate.opened()){await Task.yield()}
   var stopped=false
-  let stop=Task{try await c.stopBoth();stopped=true}
+  let stop=Task{try await c.stopBots();stopped=true}
   // A correct stop waits for the pending takeover to acknowledge cancellation.
   try await Task.sleep(nanoseconds:150000000)
   let stopReturnedEarly=stopped
@@ -167,5 +188,9 @@ import Darwin
   guard !stopReturnedEarly,!signalled,!prepared,external.isRunning,outcome=="shutdown_pending" else{
    throw ManagerError("takeover_after_stop:early=\(stopReturnedEarly),signalled=\(signalled),prepared=\(prepared),outcome=\(outcome)")
   }
+  let slack=BotController(projectURL:project,nodeURL:node,preventSleep:false,logDirectory:root.appendingPathComponent("logs"),discoverServices:{_ in []})
+  do{try await slack.takeOver();assertionFailure("Slack-only takeover accepted a shared launcher")}
+  catch{assert((error as? ManagerError)?.code=="identity_unknown")}
+  assert(external.isRunning && !fm.fileExists(atPath:project.appendingPathComponent("signalled").path) && !fm.fileExists(atPath:project.appendingPathComponent("prepared").path))
  }
 }

@@ -55,7 +55,7 @@ npm run start:slack        # Slack만
 
 ## 대화와 모델
 
-Discord 새 슬래시 질문은 최대 6,000자, 후속 질문과 Slack 질문은 최대 8,000자입니다. 프리셋 `fast`, `standard`, `deep`의 정의는 Aside와 공유하며 접수 시 스레드별 스냅샷으로 고정합니다. 기본 프리셋 선택은 플랫폼별로 저장합니다. 지원 모델은 `gpt-6-luna`, `gpt-5.6-sol`, `gpt-6-sol`; 추론 지정값은 `off|minimal|low|medium|high|xhigh|max`입니다. 현재 프리셋 값은 settings 명령으로 확인하세요.
+Discord 새 슬래시 질문은 최대 6,000자, 후속 질문과 Slack 질문은 최대 8,000자입니다. 프리셋 `fast`, `standard`, `deep`의 정의는 Aside와 공유하며 접수 시 스레드별 스냅샷으로 고정합니다. 기본 프리셋 선택은 플랫폼별로 저장합니다. 지원 모델은 `gpt-6-luna`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6-astra`; 추론 지정값은 `off|minimal|low|medium|high|xhigh|max`입니다. 현재 프리셋 값은 settings 명령으로 확인하세요.
 
 실제 완료 기록의 공급자와 모델이 지정값과 같은지 확인합니다. 추론 지정과 실제 내부 반영 증거는 구분합니다. 세션 생성 대기는 최대 **300초**, 답변 완료 대기는 최대 **60분**입니다.
 
